@@ -215,6 +215,50 @@ console.log('\nconstructor forms');
     for (const x of [a, b, c, d]) x.destroy();
 }
 
+console.log('\nlagging and latest-state-only nodes (Sonic)');
+{
+    // One node keeps only its latest state, one runs 3 blocks behind, one is a good
+    // archive node. Reads pinned near the head must all succeed, and the pool must
+    // learn to keep them away from the first two.
+    const sb: MockOpts = { ...base, maxRange: 10_000, topicOnly: true, sonicState: true, stateDepth: 100_000_000, oldLogs: true };
+    const latest = new MockNode({ ...sb, stateDepth: 0 });
+    const behind = new MockNode({ ...sb, lagBlocks: 3 });
+    const good = new MockNode({ ...sb });
+    for (const m of [latest, behind, good]) await m.start();
+    const eps = [];
+    for (const m of [latest, behind, good]) {
+        const r = await vetEndpoint(new HttpClient(m.url), ctx, { source: 'test' }, { rate: true });
+        r.rate = { cleanRps: 200, limitedAt: null, sent: 0 };
+        r.headLag = 0;            // rated before it fell behind
+        if (r.history) r.history.stateDepth = null as any;   // history unknown, like drpc/swiftnodes on Sonic
+        eps.push({ ...r, ratings: rateAll(r, { maxLag: 5 }) });
+    }
+    const q = new VettedProvider(999, { ratings: { endpoints: eps }, maxPublicAttempts: 3 });
+    await q.getBlockNumber();
+    const h = sb.head;   // the real head (a getBlockNumber may be answered by the node behind)
+    const pinned = '0x' + (h - 1).toString(16), atHead = '0x' + h.toString(16);
+    let ok = 0, failed: string[] = [];
+    for (let i = 0; i < 30; i++) {
+        try { await q.send('eth_call', [{ to: '0x' + '1'.repeat(40), data: '0x' }, pinned]); ok++; } catch (e) { failed.push((e as Error).message.slice(0, 60)); }
+    }
+    check(ok === 30, 'every eth_call pinned 1 block back answered', failed[0] ?? ok);
+    const st = q.stats().endpoints;
+    const lat = st.find(e => e.url === latest.url)!;
+    check(lat.learned.stateDepth === 0, 'learned: latest-state-only node', lat.learned);
+    latest.requests = 0;
+    for (let i = 0; i < 10; i++) await q.send('eth_getBalance', ['0x' + '1'.repeat(40), pinned]);
+    check(latest.requests === 0, 'no more pinned reads sent to it', latest.requests);
+    ok = 0; failed = [];
+    for (let i = 0; i < 20; i++) {
+        try { await q.send('eth_getLogs', [{ address: '0x' + 'a'.repeat(40), fromBlock: '0x' + (h - 5).toString(16), toBlock: atHead }]); ok++; } catch (e) { failed.push((e as Error).message.slice(0, 60)); }
+    }
+    check(ok === 20, 'every getLogs up to the head answered (a node behind is retried elsewhere)', failed[0] ?? ok);
+    const beh = q.stats().endpoints.find(e => e.url === behind.url)!;
+    check(beh.head != null && beh.head < h, 'learned: that node is behind', { head: beh.head, best: h });
+    q.destroy();
+    for (const m of [latest, behind, good]) await m.stop();
+}
+
 console.log('\nan open websocket does not keep a finished script alive');
 {
     // Scripts that never call destroy(): the socket holds the process only while

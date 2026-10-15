@@ -27,6 +27,7 @@ export type MockOpts = {
     lagBlocks?: number;        // report head - lagBlocks
     headMs?: number;           // WS newHeads interval
     wsDieAfterMs?: number;     // each subscription stops delivering this long after it starts
+    sonicState?: boolean;      // Sonic-style answers: past the head "block N not found"; outside kept state "Unknown state. First available state is N"
 };
 
 const A = '0x' + 'a'.repeat(40), B = '0x' + 'b'.repeat(40);
@@ -55,6 +56,14 @@ export class MockNode {
 
     private head() { return this.o.head - (this.o.lagBlocks ?? 0); }
 
+    /** sonicState: the error a read at `blk` gets, or null when this node has that state. */
+    private stateAt(blk: number): { error: { code: number; message: string } } | null {
+        if (!this.o.sonicState || !Number.isFinite(blk)) return null;
+        const first = Math.max(0, this.head() - this.o.stateDepth);
+        if (blk > this.head() || blk < first) return { error: { code: -32000, message: `Unknown state. First available state is ${first}` } };
+        return null;
+    }
+
     handle(req: { id?: unknown; method: string; params?: any[] }): { result?: unknown; error?: { code: number; message: string; data?: unknown } } {
         const o = this.o, p = req.params ?? [];
         this.requests++;
@@ -65,11 +74,13 @@ export class MockNode {
             case 'web3_clientVersion': return { result: 'MockNode/v1' };
             case 'eth_getBalance': {
                 const blk = parseInt(p[1], 16);
+                const st = this.stateAt(blk); if (st) return st;
                 if (this.head() - blk > o.stateDepth) return { error: { code: -32000, message: 'missing trie node' } };
                 return { result: '0x0' };
             }
             case 'eth_call': {
                 const tx = p[0] ?? {};
+                if (typeof p[1] === 'string' && /^0x/.test(p[1])) { const st = this.stateAt(parseInt(p[1], 16)); if (st) return st; }
                 if (p[2]) {
                     if (!o.stateOverride) return { error: { code: -32602, message: 'too many arguments, want at most 2' } };
                     return { result: '0x' + '0'.repeat(62) + '2a' };
@@ -86,6 +97,7 @@ export class MockNode {
             case 'eth_getLogs': {
                 const f = p[0] ?? {};
                 const from = parseInt(f.fromBlock ?? hex(this.head()), 16), to = parseInt(f.toBlock ?? hex(this.head()), 16);
+                if (o.sonicState && to > this.head()) return { error: { code: -32000, message: `block ${to} not found` } };
                 if (to - from + 1 > o.maxRange) return { error: { code: -32005, message: `block range is too large, max ${o.maxRange}` } };
                 const addrs: string[] | null = f.address == null ? null : Array.isArray(f.address) ? f.address : [f.address];
                 if (addrs && addrs.length > o.maxAddresses) return { error: { code: -32602, message: `too many addresses, max ${o.maxAddresses}` } };

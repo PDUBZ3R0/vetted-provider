@@ -51,7 +51,15 @@ import { JsonRpcProvider, Network, keccak256 } from 'ethers';
 import { HttpClient, WsClient, isRateLimited, isMissingMethod, num } from "./rpc.js";
 import { discover } from "./chainlist.js";
 import { PushFeed } from "./feed.js";
-const CAPABILITY_RE = /block range|range (?:is )?too (?:large|wide)|exceed(?:s|ed)? .*(?:range|blocks)|too many (?:blocks|addresses|results|logs)|more than \d+ (?:results|logs)|response size|limit exceeded|query returned more|missing trie node|header not found|unknown block|state .*not available|historical state|pruned|beyond history|not (?:yet )?(?:synced|available)|please specify an address|address.*required|gas .*(?:cap|limit).*exceed|exceeds (?:block )?gas limit|execution timeout|-32701/i;
+const CAPABILITY_RE = /unknown state|first available state|^\s*block\s+(?:number\s+)?#?\d+|block (?:not found|is not available|not yet)|block range|range (?:is )?too (?:large|wide)|exceed(?:s|ed)? .*(?:range|blocks)|too many (?:blocks|addresses|results|logs)|more than \d+ (?:results|logs)|response size|limit exceeded|query returned more|missing trie node|header not found|unknown block|state .*not available|historical state|pruned|beyond history|not (?:yet )?(?:synced|available)|please specify an address|address.*required|gas .*(?:cap|limit).*exceed|exceeds (?:block )?gas limit|execution timeout|-32701/i;
+/**
+ * The endpoint is behind the block asked for ("block 81056287 not found", "header
+ * not found") or keeps less state than asked for ("Unknown state. First available
+ * state is N" — Sonic nodes without archive keep only the latest state). Either way
+ * another endpoint may answer, so these are capability failures, never answers.
+ */
+const LAGGING_RE = /^\s*block\s+(?:number\s+)?#?\d+|block (?:not found|is not available|not yet|.*(?:ahead|beyond|greater than|future))|unknown block|header not found/i;
+const STATE_RE = /unknown state|first available state|state (?:is )?not available|missing trie node|historical state|pruned/i;
 const ALREADY_KNOWN = /already known|known transaction|already imported|nonce too low|replacement transaction underpriced/i;
 const HISTORY_DEPTH_GRACE = 64;
 /** Methods that submit a transaction: routed to sendRpc, never load-balanced. */
@@ -187,6 +195,10 @@ export class VettedProvider extends JsonRpcProvider {
                 this.judge(x, { method: 'eth_blockNumber', profile: 'trader' }, r);
             }));
             this.headsAt = Date.now();
+            if (this.bestHead != null)
+                for (const x of pick)
+                    if (x.head != null && Date.now() - x.headAt < 5_000)
+                        x.lag = Math.max(0, this.bestHead - x.head);
         })().finally(() => { this.headsBusy = null; });
         return this.headsBusy;
     }
@@ -214,7 +226,7 @@ export class VettedProvider extends JsonRpcProvider {
             client: kind === 'ws' ? new WsClient(url) : new HttpClient(url),
             rep, ratings: rep?.ratings,
             learned: { missing: new Set() },
-            ewmaMs: rep?.latency?.p50 || 300, head: null, headAt: 0, fails: 0, openUntil: 0, coolUntil: 0,
+            ewmaMs: rep?.latency?.p50 || 300, head: null, headAt: 0, lag: rep?.headLag ?? 0, fails: 0, openUntil: 0, coolUntil: 0,
             rps, tokens: Math.min(rps, 10), refillAt: Date.now(),
             served: 0, errors: 0,
         });
@@ -289,8 +301,15 @@ export class VettedProvider extends JsonRpcProvider {
             return false;
         if (n.block != null && this.bestHead != null) {
             const depth = this.bestHead - n.block;
-            const max = x.learned.stateDepth ?? H?.stateDepth;
-            if (depth > HISTORY_DEPTH_GRACE && max != null && !H?.archive && depth > max)
+            // A depth this endpoint taught us is exact (0 = latest state only: no
+            // pinned read at all). A rated one gets the usual grace for recent blocks.
+            const seen = x.learned.stateDepth;
+            if (seen != null && (seen === 0 || depth > seen))
+                return false;
+            const max = H?.stateDepth;
+            if (seen == null && max === 0 && !H?.archive && depth > 0)
+                return false; // rated latest-only
+            if (seen == null && depth > HISTORY_DEPTH_GRACE && max != null && !H?.archive && depth > max)
                 return false;
         }
         return true;
@@ -308,7 +327,10 @@ export class VettedProvider extends JsonRpcProvider {
     }
     weight(x, n) {
         const score = x.ratings?.[n.profile]?.pass ? x.ratings[n.profile].score : x.ratings ? 10 : 30;
-        return Math.max(1, score) * (300 / (300 + x.ewmaMs)) / (1 + x.fails);
+        // A read pinned at (or near) the head, on an endpoint that runs behind: it may
+        // not have that block yet. Strongly prefer the ones that were at the head.
+        const behind = n.block != null && x.lag > 0 && (this.bestHead == null || n.block > this.bestHead - x.lag - 2) ? 1 + 4 * x.lag : 1;
+        return Math.max(1, score) * (300 / (300 + x.ewmaMs)) / (1 + x.fails) / behind;
     }
     /** Next public member for `need`, excluding `tried`; waits for rate budget (up to budgetWaitMs) rather than going private. */
     async pickPublic(n, tried) {
@@ -457,8 +479,23 @@ export class VettedProvider extends JsonRpcProvider {
                 else
                     x.learned.maxRange = Math.min(x.learned.maxRange ?? Infinity, Math.max(1, Math.floor(n.logsRange / 2)));
             }
-            if (/trie node|header not found|unknown block|historical|pruned|not available/i.test(msg) && n.block != null && this.bestHead != null) {
-                x.learned.stateDepth = Math.min(x.learned.stateDepth ?? Infinity, Math.max(0, this.bestHead - n.block - 1));
+            if (n.block != null) {
+                const first = /first available state is\s*(\d+)/i.exec(msg);
+                if (first && Number(first[1]) > n.block) {
+                    // Keeps state from block `first` on: how deep that is, from the head.
+                    x.learned.stateDepth = Math.min(x.learned.stateDepth ?? Infinity, Math.max(0, (this.bestHead ?? Number(first[1])) - Number(first[1])));
+                }
+                else if (LAGGING_RE.test(msg) || (first && Number(first[1]) <= n.block)
+                    || (STATE_RE.test(msg) && (this.bestHead == null || this.bestHead - n.block <= HISTORY_DEPTH_GRACE))) {
+                    // Behind: it hasn't reached the block yet. Keep it off that block for a while.
+                    x.head = Math.min(x.head ?? Infinity, n.block - 1);
+                    x.headAt = now;
+                    if (this.bestHead != null)
+                        x.lag = Math.max(x.lag, this.bestHead - x.head);
+                }
+                else if (STATE_RE.test(msg) && this.bestHead != null) {
+                    x.learned.stateDepth = Math.min(x.learned.stateDepth ?? Infinity, Math.max(0, this.bestHead - n.block - 1));
+                }
             }
             if (/gas/i.test(msg) && n.gas != null)
                 x.learned.gasCap = Math.min(x.learned.gasCap ?? Infinity, n.gas - 1);
@@ -481,6 +518,9 @@ export class VettedProvider extends JsonRpcProvider {
         if (Date.now() - this.headsAt > 30_000)
             void this.refreshHeads();
         const n = this.needOf(p);
+        // Whoever asks for block N has seen it: the chain is at least there.
+        if (n.block != null && (this.bestHead == null || n.block > this.bestHead) && n.block - (this.bestHead ?? n.block) < 10_000)
+            this.bestHead = n.block;
         if (SEND_METHODS.has(n.method))
             return this.submit(p, n);
         if (this.opts.privateFor.includes(n.method))

@@ -7,17 +7,20 @@ Public RPCs for EVM chains are free and wildly uneven. One caps `eth_getLogs` at
 ```sh
 npx vetrpc vet 999                       # rate every public RPC for HyperEVM
 npx vetrpc best 999 --profile scanner    # print the best one for log scanning
+npx vetrpc vet 999 --rpc $PAID_RPC       # also rate your own node, for comparison
 ```
 
+An endpoint given with `--rpc` is tested and shown in the table, with its key masked, but it is **not** written to the ratings file. A ratings file gets committed and shared, and a key in it would leak. Give your own endpoint to the provider as `privateRpc` / `privateWs` instead.
+
 ```ts
-import { VettedProvider } from 'vetted-rpc';
+import { VettedProvider } from 'vetted-provider';
 
 const provider = new VettedProvider(999);                                   // public endpoints only
 const provider = new VettedProvider(999, process.env.PAID_RPC);             // + your private node, used sparingly
 const provider = new VettedProvider(999, { privateRpc: process.env.PAID_RPC, noTracking: true });   // or as an option
 ```
 
-Requires Node ≥ 22.6, which runs the TypeScript directly. No build step and no dependencies, except `ethers` v6 for the provider.
+Requires Node ≥ 22.6. The package ships compiled JavaScript (`dist/`, rebuilt with `npm run build`), depends only on `ws`, and needs `ethers` v6 for the provider.
 
 ## What gets tested
 

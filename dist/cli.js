@@ -6,7 +6,10 @@
 //   vetrpc best <chainId> [options]    print the best endpoint(s) from saved ratings
 //
 // vet options:
-//   --rpc <url>          also test this endpoint (repeatable) — your paid node, say
+//   --rpc <url>          also test this endpoint (repeatable) — your paid node, say.
+//                        Shown in the table (keys masked) but NOT saved: a ratings
+//                        file gets committed and shared, a key in it would leak.
+//                        Give it to VettedProvider as privateRpc / privateWs instead.
 //   --only http|ws       test one transport only
 //   --concurrency <n>    endpoints tested at once (default 4)
 //   --max-rps <n>        ceiling for the rate-limit ramp (default 40; 0 skips it)
@@ -82,7 +85,7 @@ async function vet() {
             const r = await vetEndpoint(c, ctx, { tracking: e.tracking, source: e.source }, skip);
             reports.push(r);
             done++;
-            log(`  [${done}/${eps.length}] ${r.reachable && r.chainIdOk ? 'ok ' : 'ERR'} ${e.url}  ${r.reachable && r.chainIdOk ? `p50 ${r.latency?.p50}ms` : r.error ?? ''}  (${(r.ms / 1000).toFixed(0)}s)`);
+            log(`  [${done}/${eps.length}] ${r.reachable && r.chainIdOk ? 'ok ' : 'ERR'} ${e.source === 'user' ? maskUrl(e.url) : e.url}  ${r.reachable && r.chainIdOk ? `p50 ${r.latency?.p50}ms` : r.error ?? ''}  (${(r.ms / 1000).toFixed(0)}s)`);
         }
     };
     await Promise.all(Array.from({ length: Math.min(concurrency, eps.length) }, worker));
@@ -95,11 +98,17 @@ async function vet() {
         options: { maxRps, wsWatchSec, maxLag, only: only ?? 'all', skip: Object.keys(skip), sample },
         endpoints,
     };
+    // Endpoints given with --rpc are yours (usually with a key in the URL): rated for
+    // the comparison, never written — a ratings file gets committed and shared.
+    const mine = endpoints.filter(e => e.source === 'user');
+    const saved = { ...results, endpoints: endpoints.filter(e => e.source !== 'user') };
     fs.mkdirSync(outDir, { recursive: true });
-    fs.writeFileSync(resultsFile, JSON.stringify(results, null, 2));
-    printTable(results);
-    printRecommendation(results);
-    log(`\nsaved ${path.relative(process.cwd(), resultsFile) || resultsFile}`);
+    fs.writeFileSync(resultsFile, JSON.stringify(saved, null, 2));
+    const shown = { ...results, endpoints: endpoints.map(e => e.source === 'user' ? { ...e, url: `${maskUrl(e.url)} (yours)` } : e) };
+    printTable(shown);
+    printRecommendation(shown);
+    log(`\nsaved ${path.relative(process.cwd(), resultsFile) || resultsFile}` +
+        (mine.length ? ` — without the ${mine.length} endpoint(s) given with --rpc (pass those to VettedProvider as privateRpc / privateWs)` : ''));
 }
 async function headLag(reports) {
     const live = reports.filter(r => r.reachable && r.chainIdOk);
@@ -130,6 +139,24 @@ async function headLag(reports) {
         r.head = heads[i];
         r.headLag = Math.max(0, max - heads[i]);
     } });
+}
+/** A URL safe to print: long key-like path segments, credentials and key/token query values masked. */
+function maskUrl(url) {
+    try {
+        const u = new URL(url);
+        if (u.username || u.password) {
+            u.username = '***';
+            u.password = '';
+        }
+        u.pathname = u.pathname.split('/').map(seg => /^[A-Za-z0-9_-]{16,}$/.test(seg) ? seg.slice(0, 4) + '***' : seg).join('/');
+        for (const k of [...u.searchParams.keys()])
+            if (/key|token|secret|auth|apikey/i.test(k))
+                u.searchParams.set(k, '***');
+        return u.toString().replace(/\/$/, '');
+    }
+    catch {
+        return url.replace(/[A-Za-z0-9_-]{16,}/g, m => m.slice(0, 4) + '***');
+    }
 }
 const bestScore = (rt) => Math.max(...PROFILES.map(p => rt[p].pass ? rt[p].score : -1));
 // --- output -----------------------------------------------------------------------
