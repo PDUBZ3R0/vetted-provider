@@ -1,4 +1,4 @@
-#!/usr/bin/env -S node --experimental-strip-types --disable-warning=ExperimentalWarning
+#!/usr/bin/env -S node
 import { type Report } from './probes.ts';
 import { type Profile, type Rating } from './score.ts';
 export type Results = {

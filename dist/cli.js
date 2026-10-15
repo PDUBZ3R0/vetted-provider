@@ -1,9 +1,9 @@
-#!/usr/bin/env -S node --experimental-strip-types --disable-warning=ExperimentalWarning
+#!/usr/bin/env -S node
 // -----------------------------------------------------------------------------
-// vetted-rpc — rate every public RPC for a chain, pick the best for a job.
+// vetted-provider — rate every public RPC for a chain, pick the best for a job.
 //
-//   vetted-rpc vet <chainId> [options]     test every chainlist endpoint, save ratings
-//   vetted-rpc best <chainId> [options]    print the best endpoint(s) from saved ratings
+//   vetrpc vet <chainId> [options]     test every chainlist endpoint, save ratings
+//   vetrpc best <chainId> [options]    print the best endpoint(s) from saved ratings
 //
 // vet options:
 //   --rpc <url>          also test this endpoint (repeatable) — your paid node, say
