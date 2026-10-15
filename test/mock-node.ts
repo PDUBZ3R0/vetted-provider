@@ -144,7 +144,10 @@ export class MockNode {
     }
 
     // --- WebSocket ---
+    private sockets = new Set<Socket>();
     private upgrade(req: http.IncomingMessage, socket: Socket): void {
+        this.sockets.add(socket);
+        socket.on('close', () => this.sockets.delete(socket));
         const key = req.headers['sec-websocket-key'];
         const accept = crypto.createHash('sha1').update(key + '258EAFA5-E914-47DA-95CA-C5AB0DC85B11').digest('base64');
         socket.write('HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n' + `Sec-WebSocket-Accept: ${accept}\r\n\r\n`);
@@ -185,6 +188,8 @@ export class MockNode {
     }
 
     stop(): Promise<void> {
+        // Upgraded (websocket) sockets are not HTTP connections: close() would wait on them forever.
+        for (const s of this.sockets) s.destroy();
         this.server.closeAllConnections?.();
         return new Promise(r => this.server.close(() => r()));
     }

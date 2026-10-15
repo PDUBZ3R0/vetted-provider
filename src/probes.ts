@@ -113,13 +113,14 @@ async function climb(ladder: number[], attempt: (n: number) => Promise<Reply>, b
         bad = n; error = errText(r); break;
     }
     if (good == null || bad == null) return { max: good, error };
-    for (let i = 0; i < bisectSteps && bad - good > Math.max(1, good * 0.05); i++) {
-        const mid = Math.round(Math.sqrt(good * bad));   // geometric: limits are usually round powers
-        const m = mid <= good ? good + 1 : mid >= bad ? bad - 1 : mid;
+    let lo: number = good, hi: number = bad;
+    for (let i = 0; i < bisectSteps && hi - lo > Math.max(1, lo * 0.05); i++) {
+        const mid = Math.round(Math.sqrt(lo * hi));   // geometric: limits are usually round powers
+        const m: number = mid <= lo ? lo + 1 : mid >= hi ? hi - 1 : mid;
         const r = await attempt(m);
-        if (ok(r)) good = m; else bad = m;
+        if (ok(r)) lo = m; else hi = m;
     }
-    return { max: good, error };
+    return { max: lo, error };
 }
 
 // --- the probes -------------------------------------------------------------------

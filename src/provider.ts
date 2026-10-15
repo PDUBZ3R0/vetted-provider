@@ -52,6 +52,8 @@ import type { Profile, Rating } from './score.ts';
 export type VettedOptions = {
     /** Your own (usually paid) endpoint, http(s) or ws(s). Used only when public ones cannot do the job. */
     privateRpc?: string | null;
+    /** Your own websocket endpoint. Joins privateRpc as a private transport, preferred while it is up (no per-request HTTP/TLS). */
+    privateWs?: string | null;
     /** Ratings: a results file, a directory holding <chainId>.json, or the parsed object. Default ./results. */
     ratings?: string | { endpoints: Array<Report & { ratings: Record<Profile, Rating> }> };
     /**
@@ -140,11 +142,13 @@ const parseBlock = (t: unknown): number | undefined => typeof t === 'string' && 
 export class VettedProvider extends JsonRpcProvider {
     readonly chainId: number;
     readonly privateRpc: string | null;
-    private readonly opts: Required<Omit<VettedOptions, 'ratings' | 'onRoute' | 'privateRps' | 'privateRpc'>> & Pick<VettedOptions, 'ratings' | 'onRoute' | 'privateRps'>;
+    readonly privateWs: string | null;
+    private readonly opts: Required<Omit<VettedOptions, 'ratings' | 'onRoute' | 'privateRps' | 'privateRpc' | 'privateWs' | 'sendRpc'>> & Pick<VettedOptions, 'ratings' | 'onRoute' | 'privateRps' | 'sendRpc'>;
     private members: Member[] = [];
     /** Explicit transaction targets (sendRpc). Not part of the read pool. */
     private senders: Member[] = [];
-    private ready: Promise<void>;
+    /** Resolves once the pool is built. (Not `ready`: that is ethers' own getter.) */
+    private booted: Promise<void>;
     private bestHead: number | null = null;
     /** Filter id -> the member that created it: eth_getFilterChanges / eth_uninstallFilter must go back there. */
     private filters = new Map<string, Member>();
@@ -172,13 +176,14 @@ export class VettedProvider extends JsonRpcProvider {
         super(privateRpc ?? 'http://vetted-rpc.invalid', network, { staticNetwork: network, batchMaxCount: 1, polling: true });
         this.chainId = chainId;
         this.privateRpc = privateRpc;
-        const { privateRpc: _omit, ...rest } = o;
+        this.privateWs = o.privateWs || null;
+        const { privateRpc: _omit, privateWs: _omitWs, ...rest } = o;
         this.opts = {
             privateFor: [], useWs: true, noTracking: false, timeoutMs: 15_000, maxPublicAttempts: 3, budgetWaitMs: 2000,
             ...rest,
         };
-        this.ready = this.init();
-        this.ready.catch(() => { /* surfaced on first request */ });
+        this.booted = this.init();
+        this.booted.catch(() => { /* surfaced on first request */ });
     }
 
     // --- setup --------------------------------------------------------------------
@@ -187,7 +192,7 @@ export class VettedProvider extends JsonRpcProvider {
         const rated = this.loadRatings();
         if (rated?.length) {
             for (const r of rated) {
-                if (r.url === this.privateRpc) continue;
+                if (r.url === this.privateRpc || r.url === this.privateWs) continue;
                 if (!r.reachable || !r.chainIdOk) continue;
                 if (this.opts.noTracking && r.tracking === 'yes') continue;
                 if (r.kind === 'ws' && !this.opts.useWs) continue;
@@ -197,12 +202,13 @@ export class VettedProvider extends JsonRpcProvider {
         } else {
             const info = await discover(this.chainId).catch(() => null);
             for (const e of info?.endpoints ?? []) {
-                if (e.url === this.privateRpc || (e.kind === 'ws' && !this.opts.useWs)) continue;
+                if (e.url === this.privateRpc || e.url === this.privateWs || (e.kind === 'ws' && !this.opts.useWs)) continue;
                 if (this.opts.noTracking && e.tracking === 'yes') continue;
                 this.add(e.url, e.kind, false);
             }
         }
         if (this.privateRpc) this.add(this.privateRpc, /^wss?:/i.test(this.privateRpc) ? 'ws' : 'http', true);
+        if (this.privateWs && this.privateWs !== this.privateRpc) this.add(this.privateWs, 'ws', true);
         const send = this.opts.sendRpc == null ? [] : Array.isArray(this.opts.sendRpc) ? this.opts.sendRpc : [this.opts.sendRpc];
         for (const url of [...new Set(send.filter(Boolean))]) {
             const pv = this.privateMember();
@@ -358,7 +364,29 @@ export class VettedProvider extends JsonRpcProvider {
         }
     }
 
-    private privateMember(): Member | null { return this.members.find(x => x.isPrivate) ?? null; }
+    /** The private transport to use now: the websocket while it is up, else HTTP. */
+    private privateMember(): Member | null {
+        const now = Date.now();
+        const mine = this.members.filter(x => x.isPrivate);
+        return mine.find(x => x.kind === 'ws' && this.available(x, now))
+            ?? mine.find(x => this.available(x, now))
+            ?? mine[0] ?? null;
+    }
+
+    /**
+     * The best-rated PUBLIC endpoint for a job, e.g. a websocket to subscribe on:
+     * bestUrl('subscriber', 'ws'). Null when no rated public endpoint passes —
+     * the caller then decides whether its private endpoint is worth it.
+     */
+    async bestUrl(profile: Profile, kind?: 'http' | 'ws'): Promise<string | null> {
+        await this.booted;
+        const now = Date.now();
+        const n: Need = { method: 'eth_blockNumber', profile };
+        const best = this.members
+            .filter(x => !x.isPrivate && (!kind || x.kind === kind) && x.ratings?.[profile]?.pass && now >= x.openUntil)
+            .sort((a, b) => this.weight(b, n) - this.weight(a, n))[0];
+        return best?.url ?? null;
+    }
 
     // --- sending ------------------------------------------------------------------------
 
@@ -432,7 +460,7 @@ export class VettedProvider extends JsonRpcProvider {
     }
 
     private async route(p: JsonRpcPayload): Promise<JsonRpcResult | JsonRpcError> {
-        await this.ready;
+        await this.booted;
         if (Date.now() - this.headsAt > 30_000) void this.refreshHeads();
         const n = this.needOf(p);
         if (SEND_METHODS.has(n.method)) return this.submit(p, n);
@@ -454,17 +482,29 @@ export class VettedProvider extends JsonRpcProvider {
             }
             last = r;
         }
-        const pv = this.privateMember();
-        if (pv && this.available(pv, Date.now())) {
-            if (tried.size) this.usage.privateFallbacks++;
+        // Private transports, preferred first (websocket while it is up, then HTTP): the
+        // next one gets a try when one refuses or fails.
+        const first = this.privateMember();
+        const privates = first ? [first, ...this.members.filter(x => x.isPrivate && x !== first)] : [];
+        if (privates.length && tried.size) this.usage.privateFallbacks++;
+        for (const pv of privates) {
+            if (!this.available(pv, Date.now())) continue;
             const r = await this.exchange(pv, p);
             const outcome = this.judge(pv, n, r);
             this.opts.onRoute?.({ method: n.method, url: pv.url, private: true, outcome, ms: Math.round(r.ms), detail: r.error?.message ?? r.transport });
             this.usage.private++;
-            if (outcome === 'ok' && /^eth_new(Block|PendingTransaction)?Filter$/.test(n.method) && typeof r.result === 'string') this.filters.set(r.result, pv);
-            return this.toResult(p, r);
+            if (outcome === 'ok' || outcome === 'answer-error') {
+                if (outcome === 'ok' && /^eth_new(Block|PendingTransaction)?Filter$/.test(n.method) && typeof r.result === 'string') this.filters.set(r.result, pv);
+                return this.toResult(p, r);
+            }
+            last = r;
         }
         if (last) return this.toResult(p, last);
+        if (n.topicOnly) {
+            // The same code and words a refusing endpoint uses, so callers that already
+            // handle that refusal (fall back to address-chunked filters) handle this too.
+            return { id: p.id, error: { code: -32701, message: `Please specify an address in your request — no endpoint for chain ${this.chainId} accepts address-less eth_getLogs` } } as JsonRpcError;
+        }
         return { id: p.id, error: { code: -32603, message: `VettedProvider: no endpoint can serve ${n.method}${n.logsRange ? ` over ${n.logsRange} blocks` : ''} on chain ${this.chainId}` } } as JsonRpcError;
     }
 
@@ -534,7 +574,7 @@ export class VettedProvider extends JsonRpcProvider {
      * privateFor). The first success wins.
      */
     private async fanOut(p: JsonRpcPayload, n: Need): Promise<JsonRpcResult | JsonRpcError> {
-        await this.ready;
+        await this.booted;
         const now = Date.now();
         const targets = [
             ...this.members.filter(x => x.isPrivate),
@@ -551,9 +591,11 @@ export class VettedProvider extends JsonRpcProvider {
         return this.firstAccepted(p, n, replies);
     }
 
-    override async _send(payload: JsonRpcPayload | JsonRpcPayload[]): Promise<Array<JsonRpcResult | JsonRpcError>> {
+    // ethers types the reply as JsonRpcResult[], but its own HTTP _send returns error
+    // objects in the same array (and getRpcError reads them); the cast says so.
+    override async _send(payload: JsonRpcPayload | JsonRpcPayload[]): Promise<JsonRpcResult[]> {
         const list = Array.isArray(payload) ? payload : [payload];
-        return Promise.all(list.map(p => this.route(p)));
+        return Promise.all(list.map(p => this.route(p))) as Promise<JsonRpcResult[]>;
     }
 
     // --- introspection ----------------------------------------------------------------

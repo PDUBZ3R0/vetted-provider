@@ -143,6 +143,33 @@ console.log('\ntransactions go to sendRpc, and only there');
     zero();
 }
 
+console.log('\nprivate websocket, bestUrl, address-less filters nobody serves');
+{
+    const ratings = { endpoints };
+    const pw = new MockNode({ ...base, maxRange: 1_000_000 }); await pw.start();
+    const all = [narrow, wide, priv, pw];
+    const zero = () => { for (const m of all) m.requests = 0; };
+    let x = new VettedProvider(999, { privateRpc: priv.url, privateWs: pw.wsUrl, ratings });
+    await x.send('eth_blockNumber', []); zero();
+    await x.send('eth_getLogs', [{ fromBlock: '0x' + (head - 199_999).toString(16), toBlock: '0x' + head.toString(16), address: '0x' + 'c'.repeat(40) }]);
+    check(pw.requests === 1 && priv.requests === 0, 'private work goes over the private websocket while it is up', all.map(m => m.requests));
+    await pw.stop();
+    zero();
+    await x.send('eth_getLogs', [{ fromBlock: '0x' + (head - 199_999).toString(16), toBlock: '0x' + head.toString(16), address: '0x' + 'c'.repeat(40) }]);
+    await x.send('eth_getLogs', [{ fromBlock: '0x' + (head - 199_999).toString(16), toBlock: '0x' + head.toString(16), address: '0x' + 'c'.repeat(40) }]);
+    check(priv.requests >= 1, 'private websocket down: private HTTP takes over', all.map(m => m.requests));
+    check(await x.bestUrl('scanner', 'http') === wide.url, 'bestUrl(scanner, http) is the wide endpoint', await x.bestUrl('scanner', 'http'));
+    check(await x.bestUrl('subscriber', 'ws') === null, 'bestUrl(subscriber, ws) is null when no public websocket passes');
+    x.destroy();
+
+    x = new VettedProvider(999, { ratings: { endpoints: endpoints.filter(e => e.url === narrow.url) } });   // only the address-requiring one
+    let err: any = null;
+    try { await x.send('eth_getLogs', [{ fromBlock: '0x' + (head - 9).toString(16), toBlock: '0x' + head.toString(16), topics: ['0x8c5be1e5ebec7d5bd14f71427d1e84f3dd0314c0f7b2291e5b200ac8c7c3b925'] }]); } catch (e) { err = e; }
+    check(err?.error?.code === -32701 && /specify an address/i.test(err?.error?.message ?? ''), 'no public accepts topic-only and no private: answered -32701 "specify an address"', err?.error);
+    x.destroy();
+    zero();
+}
+
 console.log('\nfilters stay on the node that holds them');
 {
     const id = await p.send('eth_newFilter', [{ address: '0x' + 'a'.repeat(40) }]);
