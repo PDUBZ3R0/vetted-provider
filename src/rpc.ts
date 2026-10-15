@@ -1,9 +1,11 @@
 // -----------------------------------------------------------------------------
-// Raw JSON-RPC clients for probing: HTTP (fetch) and WebSocket (Node's global
-// WebSocket). No ethers on purpose: the probes need to see exactly what came
+// Raw JSON-RPC clients for probing: HTTP (fetch) and WebSocket (the `ws`
+// package — Node's global WebSocket hides its socket, so it can't be unref'd). No ethers on purpose: the probes need to see exactly what came
 // back — HTTP status, Retry-After, the error object as sent, how long it took —
 // and a library's retries, batching and error wrapping would hide all of it.
 // -----------------------------------------------------------------------------
+
+import WebSocket from 'ws';
 
 export type RpcError = { code: number; message: string; data?: unknown };
 
@@ -131,7 +133,7 @@ export class WsClient implements Client {
             let ws: WebSocket;
             try { ws = new WebSocket(this.url); } catch (e) { done((e as Error).message); return; }
             this.ws = ws;
-            ws.onopen = () => done(null);
+            ws.onopen = () => { this.hold(); done(null); };
             // The browser-style WebSocket hides the HTTP status of a refused upgrade
             // (HyperEVM answers 405); all we get is an error event, then close.
             ws.onerror = (ev) => done(`connect failed${(ev as unknown as { message?: string }).message ? `: ${(ev as unknown as { message: string }).message}` : ''}`);
@@ -142,11 +144,23 @@ export class WsClient implements Client {
                 for (const [, p] of this.batches) { clearTimeout(p.timer); p.resolve({ transport: this.closedWhy }); }
                 this.pending.clear(); this.batches.clear();
             };
-            ws.onmessage = (ev) => this.onMessage(typeof ev.data === 'string' ? ev.data : Buffer.from(ev.data as ArrayBuffer).toString());
+            ws.onmessage = (ev) => { this.onMessage(typeof ev.data === 'string' ? ev.data : Buffer.from(ev.data as ArrayBuffer).toString()); this.hold(); };
         });
     }
 
     get open(): boolean { return this.ws?.readyState === 1; }
+
+    /**
+     * Keep the process alive only while something is waiting on this socket (a
+     * request, a batch, a subscription). An idle open socket must not stop a
+     * finished script from exiting — the old single-endpoint provider did the
+     * same with ethers' socket.
+     */
+    private hold(): void {
+        const sock = (this.ws as unknown as { _socket?: { ref(): void; unref(): void } } | null)?._socket;
+        if (!sock) return;
+        if (this.pending.size || this.batches.size || this.subs.size) sock.ref(); else sock.unref();
+    }
 
     private onMessage(text: string): void {
         this.lastRx = Date.now();
@@ -181,10 +195,11 @@ export class WsClient implements Client {
         if (!this.open) return Promise.resolve({ transport: this.closedWhy ?? 'socket not open', ms: 0 });
         const id = nextId++;
         return new Promise(resolve => {
-            const timer = setTimeout(() => { this.pending.delete(id); resolve({ transport: `timeout ${timeoutMs}ms`, ms: performance.now() - t0 }); }, timeoutMs);
+            const timer = setTimeout(() => { this.pending.delete(id); this.hold(); resolve({ transport: `timeout ${timeoutMs}ms`, ms: performance.now() - t0 }); }, timeoutMs);
             this.pending.set(id, { resolve: v => resolve(v as Reply), timer, t0 });
+            this.hold();
             try { this.ws!.send(JSON.stringify({ jsonrpc: '2.0', id, method, params })); }
-            catch (e) { clearTimeout(timer); this.pending.delete(id); resolve({ transport: (e as Error).message, ms: performance.now() - t0 }); }
+            catch (e) { clearTimeout(timer); this.pending.delete(id); this.hold(); resolve({ transport: (e as Error).message, ms: performance.now() - t0 }); }
         });
     }
 
@@ -195,7 +210,7 @@ export class WsClient implements Client {
         const body = calls.map(c => ({ jsonrpc: '2.0', id: nextId++, method: c.method, params: c.params ?? [] }));
         const key = body.map(b => b.id).join(',');
         return new Promise<Out>(resolve => {
-            const timer = setTimeout(() => { this.batches.delete(key); resolve({ replies: null, reply: { transport: `timeout ${timeoutMs}ms`, ms: performance.now() - t0 } }); }, timeoutMs);
+            const timer = setTimeout(() => { this.batches.delete(key); this.hold(); resolve({ replies: null, reply: { transport: `timeout ${timeoutMs}ms`, ms: performance.now() - t0 } }); }, timeoutMs);
             this.batches.set(key, {
                 resolve: v => {
                     const x = v as { replies?: Out['replies']; ms?: number; transport?: string };
@@ -203,8 +218,9 @@ export class WsClient implements Client {
                 },
                 timer, t0,
             });
+            this.hold();
             try { this.ws!.send(JSON.stringify(body)); }
-            catch (e) { clearTimeout(timer); this.batches.delete(key); resolve({ replies: null, reply: { transport: (e as Error).message, ms: 0 } }); }
+            catch (e) { clearTimeout(timer); this.batches.delete(key); this.hold(); resolve({ replies: null, reply: { transport: (e as Error).message, ms: 0 } }); }
         });
     }
 
@@ -213,6 +229,7 @@ export class WsClient implements Client {
         const r = await this.call('eth_subscribe', params);
         if (!ok(r) || typeof r.result !== 'string') return r;
         this.subs.set(r.result, onEvent);
+        this.hold();
         return r.result;
     }
 

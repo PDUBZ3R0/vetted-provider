@@ -8,6 +8,8 @@ import { HttpClient } from '../src/rpc.ts';
 import { vetEndpoint, sampleLogs } from '../src/probes.ts';
 import { rateAll } from '../src/score.ts';
 import { VettedProvider, type RouteEvent } from '../src/provider.ts';
+import { spawn } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
 
 let pass = 0, fail = 0;
 const check = (cond: boolean, what: string, got?: unknown) => {
@@ -211,6 +213,24 @@ console.log('\nconstructor forms');
     check(c.privateRpc === null, 'options object without privateRpc: public only');
     check(d.privateRpc === priv.url, 'null URL, privateRpc in the options');
     for (const x of [a, b, c, d]) x.destroy();
+}
+
+console.log('\nan open websocket does not keep a finished script alive');
+{
+    // A script that never calls destroy() must still exit once its last reply is in.
+    const rpcSrc = fileURLToPath(new URL('../src/rpc.ts', import.meta.url));
+    const child = `import { WsClient } from ${JSON.stringify(rpcSrc)};
+        const c = new WsClient(${JSON.stringify(priv.wsUrl)});
+        if (await c.connect()) process.exit(2);
+        const r = await c.call('eth_blockNumber', []);
+        if (!r.result) process.exit(3);`;
+    const t0 = Date.now();
+    const code = await new Promise<number | string>(resolve => {
+        const cp = spawn(process.execPath, ['--experimental-strip-types', '--disable-warning=ExperimentalWarning', '--input-type=module', '-e', child], { stdio: 'inherit' });
+        const kill = setTimeout(() => { cp.kill(); resolve('hung'); }, 5000);
+        cp.on('exit', c => { clearTimeout(kill); resolve(c ?? 'killed'); });
+    });
+    check(code === 0, 'process exited on its own after the reply', { code, ms: Date.now() - t0 });
 }
 
 p.destroy();

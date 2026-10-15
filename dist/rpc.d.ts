@@ -69,6 +69,13 @@ export declare class WsClient implements Client {
     /** Open the socket. Resolves to an error string on failure, null on success. */
     connect(timeoutMs?: number): Promise<string | null>;
     get open(): boolean;
+    /**
+     * Keep the process alive only while something is waiting on this socket (a
+     * request, a batch, a subscription). An idle open socket must not stop a
+     * finished script from exiting — the old single-endpoint provider did the
+     * same with ethers' socket.
+     */
+    private hold;
     private onMessage;
     call(method: string, params?: unknown[], timeoutMs?: number): Promise<Reply>;
     batch(calls: Call[], timeoutMs?: number): Promise<{

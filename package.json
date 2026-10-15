@@ -31,10 +31,14 @@
     "websockets",
     "ws"
   ],
+  "dependencies": {
+    "ws": "^8.17.0"
+  },
   "devDependencies": {
     "ethers": "^6.13.4",
     "typescript": "^5.8.3",
-    "@types/node": "^22.0.0"
+    "@types/node": "^22.0.0",
+    "@types/ws": "^8.5.12"
   },
   "exports": {
     ".": {
