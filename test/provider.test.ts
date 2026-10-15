@@ -217,20 +217,25 @@ console.log('\nconstructor forms');
 
 console.log('\nan open websocket does not keep a finished script alive');
 {
-    // A script that never calls destroy() must still exit once its last reply is in.
+    // Scripts that never call destroy(): the socket holds the process only while
+    // something is waiting on it — a request, or a live subscription.
     const rpcSrc = fileURLToPath(new URL('../src/rpc.ts', import.meta.url));
-    const child = `import { WsClient } from ${JSON.stringify(rpcSrc)};
-        const c = new WsClient(${JSON.stringify(priv.wsUrl)});
-        if (await c.connect()) process.exit(2);
-        const r = await c.call('eth_blockNumber', []);
-        if (!r.result) process.exit(3);`;
-    const t0 = Date.now();
-    const code = await new Promise<number | string>(resolve => {
+    const run = (body: string, limitMs: number) => new Promise<number | string>(resolve => {
+        const child = `import { WsClient } from ${JSON.stringify(rpcSrc)};
+            const c = new WsClient(${JSON.stringify(priv.wsUrl)});
+            if (await c.connect()) process.exit(2);
+            ${body}`;
         const cp = spawn(process.execPath, ['--experimental-strip-types', '--disable-warning=ExperimentalWarning', '--input-type=module', '-e', child], { stdio: 'inherit' });
-        const kill = setTimeout(() => { cp.kill(); resolve('hung'); }, 5000);
+        const kill = setTimeout(() => { cp.kill(); resolve('alive'); }, limitMs);
         cp.on('exit', c => { clearTimeout(kill); resolve(c ?? 'killed'); });
     });
-    check(code === 0, 'process exited on its own after the reply', { code, ms: Date.now() - t0 });
+    const call = await run(`const r = await c.call('eth_blockNumber', []); if (!r.result) process.exit(3);`, 5000);
+    check(call === 0, 'exits on its own after the last reply', call);
+    const subbed = await run(`const id = await c.subscribe(['newHeads'], () => {}); if (typeof id !== 'string') process.exit(3);`, 1500);
+    check(subbed === 'alive', 'a live subscription keeps it running', subbed);
+    const unsubbed = await run(`const id = await c.subscribe(['newHeads'], () => {}); if (typeof id !== 'string') process.exit(3);
+            await c.unsubscribe(id);`, 5000);
+    check(unsubbed === 0, 'exits once the subscription is dropped', unsubbed);
 }
 
 p.destroy();

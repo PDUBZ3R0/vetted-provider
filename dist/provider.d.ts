@@ -1,4 +1,5 @@
-import { JsonRpcProvider, type JsonRpcPayload, type JsonRpcResult } from 'ethers';
+import { JsonRpcProvider, type JsonRpcPayload, type JsonRpcResult, type Subscriber, type Subscription } from 'ethers';
+import { type FeedEvent } from './feed.ts';
 import type { Report } from './probes.ts';
 import type { Profile, Rating } from './score.ts';
 export type VettedOptions = {
@@ -39,6 +40,19 @@ export type VettedOptions = {
     budgetWaitMs?: number;
     /** Called for routing decisions — for logs while tuning. */
     onRoute?: (e: RouteEvent) => void;
+    /**
+     * provider.on('block' | filter): 'push' (default) subscribes over a websocket
+     * with failover and backfill; 'poll' always polls eth_getLogs over the pool.
+     */
+    subscriptions?: 'push' | 'poll';
+    /** Subscribe on your private websocket first, publics as fallback (default: publics first). */
+    subscribePrivate?: boolean;
+    /** A subscription socket that sends nothing (not even a head) for this long is treated as dead. Default 30000 ms. */
+    stallMs?: number;
+    /** Cooldown base for a failed subscription endpoint, and how often polling retries push. Default 30000 ms. */
+    feedRetryMs?: number;
+    /** Subscription feed events: connected, failover, backfill, polling. */
+    onFeed?: (e: FeedEvent) => void;
 };
 export type RouteEvent = {
     method: string;
@@ -70,6 +84,8 @@ export declare class VettedProvider extends JsonRpcProvider {
         privateFallbacks: number;
         waitsForBudget: number;
     };
+    private readonly feed;
+    private feedListeners;
     /**
      * @param chainId  the chain to serve
      * @param privateOrOptions  your private RPC URL, or the options object (which may carry `privateRpc`)
@@ -103,6 +119,16 @@ export declare class VettedProvider extends JsonRpcProvider {
      * the caller then decides whether its private endpoint is worth it.
      */
     bestUrl(profile: Profile, kind?: 'http' | 'ws'): Promise<string | null>;
+    /**
+     * Websockets to subscribe on, best first: public ones rated `subscriber`
+     * (unrated ones too when there are no ratings), then yours — or yours first
+     * with `subscribePrivate`. A rated websocket that failed `subscriber` is left
+     * out: it was seen not to deliver.
+     */
+    private feedCandidates;
+    /** Listen to subscription feed events (connected, failover, backfill, polling). Returns the remover. */
+    onFeed(listener: (e: FeedEvent) => void): () => void;
+    _getSubscriber(sub: Subscription): Subscriber;
     private exchange;
     /** Record the outcome on the member; returns what the router should do next. */
     private judge;
@@ -134,6 +160,19 @@ export declare class VettedProvider extends JsonRpcProvider {
             waitsForBudget: number;
         };
         bestHead: number | null;
+        feed: {
+            connects: number;
+            failovers: number;
+            backfilledLogs: number;
+            duplicatesDropped: number;
+            pushedLogs: number;
+            heads: number;
+            mode: "push" | "idle" | "switching" | "poll";
+            url: string | null;
+            private: boolean;
+            subscriptions: number;
+            lastHead: number;
+        };
         sendTo: string[];
         endpoints: {
             url: string;

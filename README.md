@@ -1,12 +1,12 @@
-# vetted-rpc
+# vetted-provider
 
-Public RPCs for EVM chains are free and wildly uneven. One caps `eth_getLogs` at 500 blocks; another refuses filters without an address; a third drops the revert reason from every failed `eth_call`, so nothing can be simulated against it; a fourth is fast but 8 blocks behind. None of that is on chainlist.
+Public RPCs for EVM chains are free and wildly uneven. One caps `eth_getLogs` at 500 blocks; another refuses filters without an address; a third drops the revert reason from every failed `eth_call`, so nothing can be simulated against it; a fourth is fast but 8 blocks behind... some are heavily rate-limited and other don't even work at all. None of that information is available on chainlist.
 
 **vetted-rpc** tests every public endpoint chainlist knows for a chain, rates each one per job, and gives you an ethers provider that routes each request to an endpoint that can actually serve it.
 
 ```sh
-npx vetted-rpc vet 999                       # rate every public RPC for HyperEVM
-npx vetted-rpc best 999 --profile scanner    # print the best one for log scanning
+npx vetrpc vet 999                       # rate every public RPC for HyperEVM
+npx vetrpc best 999 --profile scanner    # print the best one for log scanning
 ```
 
 ```ts
@@ -96,7 +96,29 @@ p.stats();  // per endpoint: served, errors, latency, state (ok / cooling / down
 
 Without a ratings file it still works on chainlist's unrated list: it's gentle with every endpoint (5 rps) and learns limits from errors.
 
-**Subscriptions poll.** `provider.on(filter, …)` polls stateless `eth_getLogs` rather than `eth_newFilter` + `eth_getFilterChanges`. A filter id lives on one backend node, so filter-id polling fails across a pool, and often on a single load-balanced public endpoint too. If you call the filter methods yourself, they're pinned to the endpoint that created the filter. Push subscriptions over the pooled WebSockets are not supported yet.
+### Subscriptions
+
+`provider.on('block', …)` and `provider.on(filter, …)` are real `eth_subscribe` pushes. They run on one dedicated WebSocket: the best one rated `subscriber`, then your `privateWs` (or yours first with `subscribePrivate: true`).
+
+- **Liveness.** A `newHeads` subscription stays open as a heartbeat. A socket that sends nothing for `stallMs` counts as dead; public sockets are known to go quiet with no error at all.
+- **Failover.** A dead, silent or refusing socket cools down (with growing backoff), and every subscription moves to the next endpoint.
+- **No gaps, no repeats, no reordering.** The gap since the last head is backfilled with `eth_getLogs` through the pool. Logs the new socket pushes meanwhile are held until the backfill is out, so you never get an older log after a newer one. The overlap is de-duplicated by `(blockHash, logIndex)`. Block events come once per block, in order.
+- **Fallback.** With no working WebSocket it polls `eth_getLogs` at `pollingInterval`, and returns to push when one works again.
+- **Exit.** The socket keeps the process alive only while something is subscribed; remove the last listener and a script exits.
+
+```ts
+const p = new VettedProvider(8453, {
+  privateWs: process.env.PAID_WS,
+  subscribePrivate: true,   // subscribe on your own socket first
+  stallMs: 30_000,          // silence that counts as a dead socket
+  feedRetryMs: 30_000,      // cooldown base for a failed socket; also how often polling retries push
+  onFeed: e => console.log('feed', e),   // connected | failover | backfill | backfill-failed | polling | error
+});
+p.on({ address: pool, topics: [SWAP] }, log => …);
+p.stats().feed;   // { mode: 'push' | 'poll' | …, url, connects, failovers, backfilledLogs, duplicatesDropped, … }
+```
+
+`subscriptions: 'poll'` turns push off. Filter-id polling (`eth_newFilter` + `eth_getFilterChanges`) is never used for `on()`: a filter id lives on one backend node, so it fails across a pool, and often on a single load-balanced public endpoint too. If you call the filter methods yourself, they're pinned to the endpoint that created the filter.
 
 ## Tests
 
@@ -106,8 +128,9 @@ npm test
 
 Runs against mock JSON-RPC nodes (HTTP and WebSocket) with known limits. Every limit configured on a mock must be the limit the probes report, and the provider must route around them, keeping the private endpoint idle unless it's needed. No network required.
 
+`test/feed.test.ts` checks subscriptions against a real node. It runs one [anvil](https://getfoundry.sh) with two WebSocket proxies in front of it, which it silences and cuts to force failover, backfill and the polling fallback. It's skipped when anvil isn't installed.
+
 ## License
 
 MIT
 
-# vetted-provider

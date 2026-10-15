@@ -121,6 +121,8 @@ export class WsClient implements Client {
     readonly subs = new Map<string, (result: unknown) => void>();
     /** Time of the last frame of any kind from the server. */
     lastRx = 0;
+    /** Called once when an open socket closes (not when connect() itself fails). */
+    onClose?: (why: string) => void;
 
     constructor(url: string) { this.url = url; }
 
@@ -143,6 +145,8 @@ export class WsClient implements Client {
                 for (const [, p] of this.pending) { clearTimeout(p.timer); p.resolve({ transport: this.closedWhy }); }
                 for (const [, p] of this.batches) { clearTimeout(p.timer); p.resolve({ transport: this.closedWhy }); }
                 this.pending.clear(); this.batches.clear();
+                this.subs.clear();
+                this.onClose?.(this.closedWhy);
             };
             ws.onmessage = (ev) => { this.onMessage(typeof ev.data === 'string' ? ev.data : Buffer.from(ev.data as ArrayBuffer).toString()); this.hold(); };
         });
@@ -233,7 +237,15 @@ export class WsClient implements Client {
         return r.result;
     }
 
+    /** eth_unsubscribe. Drops the handler first, so a node that never answers can't keep the process alive. */
+    async unsubscribe(id: string): Promise<Reply> {
+        this.subs.delete(id);
+        this.hold();
+        return this.open ? this.call('eth_unsubscribe', [id]) : { transport: 'socket not open', ms: 0 };
+    }
+
     close(): void {
+        this.subs.clear();
         try { this.ws?.close(); } catch { /* */ }
         for (const [, p] of this.pending) clearTimeout(p.timer);
         for (const [, p] of this.batches) clearTimeout(p.timer);

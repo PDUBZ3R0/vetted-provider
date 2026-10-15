@@ -37,15 +37,21 @@
 // learns from it (lowers that endpoint's known limit, cools it down, opens its
 // circuit) and the request moves to the next candidate.
 //
+// SUBSCRIPTIONS. provider.on('block') and provider.on(filter) are real
+// eth_subscribe pushes on the best websocket rated `subscriber`, with silent-
+// socket detection, failover to the next endpoint, and a getLogs backfill of the
+// gap — see feed.ts. With no usable websocket they poll instead.
+//
 // Ratings come from `vetted-rpc vet <chainId>` (results/<chainId>.json). Without
 // them the pool still works on chainlist's unrated list, learning as it goes.
 // -----------------------------------------------------------------------------
 
 import fs from 'node:fs';
 import path from 'node:path';
-import { JsonRpcProvider, Network, keccak256, type JsonRpcPayload, type JsonRpcResult, type JsonRpcError } from 'ethers';
+import { JsonRpcProvider, Network, keccak256, type JsonRpcPayload, type JsonRpcResult, type JsonRpcError, type Subscriber, type Subscription } from 'ethers';
 import { HttpClient, WsClient, type Client, type Reply, isRateLimited, isMissingMethod, num } from './rpc.ts';
 import { discover } from './chainlist.ts';
+import { PushFeed, type FeedEvent, type LogFilter } from './feed.ts';
 import type { Report } from './probes.ts';
 import type { Profile, Rating } from './score.ts';
 
@@ -83,6 +89,19 @@ export type VettedOptions = {
     budgetWaitMs?: number;
     /** Called for routing decisions — for logs while tuning. */
     onRoute?: (e: RouteEvent) => void;
+    /**
+     * provider.on('block' | filter): 'push' (default) subscribes over a websocket
+     * with failover and backfill; 'poll' always polls eth_getLogs over the pool.
+     */
+    subscriptions?: 'push' | 'poll';
+    /** Subscribe on your private websocket first, publics as fallback (default: publics first). */
+    subscribePrivate?: boolean;
+    /** A subscription socket that sends nothing (not even a head) for this long is treated as dead. Default 30000 ms. */
+    stallMs?: number;
+    /** Cooldown base for a failed subscription endpoint, and how often polling retries push. Default 30000 ms. */
+    feedRetryMs?: number;
+    /** Subscription feed events: connected, failover, backfill, polling. */
+    onFeed?: (e: FeedEvent) => void;
 };
 
 export type RouteEvent = { method: string; url: string; private: boolean; outcome: 'ok' | 'answer-error' | 'capability' | 'rate-limited' | 'transport'; ms: number; detail?: string };
@@ -143,7 +162,7 @@ export class VettedProvider extends JsonRpcProvider {
     readonly chainId: number;
     readonly privateRpc: string | null;
     readonly privateWs: string | null;
-    private readonly opts: Required<Omit<VettedOptions, 'ratings' | 'onRoute' | 'privateRps' | 'privateRpc' | 'privateWs' | 'sendRpc'>> & Pick<VettedOptions, 'ratings' | 'onRoute' | 'privateRps' | 'sendRpc'>;
+    private readonly opts: Required<Omit<VettedOptions, 'ratings' | 'onRoute' | 'privateRps' | 'privateRpc' | 'privateWs' | 'sendRpc' | 'onFeed'>> & Pick<VettedOptions, 'ratings' | 'onRoute' | 'privateRps' | 'sendRpc' | 'onFeed'>;
     private members: Member[] = [];
     /** Explicit transaction targets (sendRpc). Not part of the read pool. */
     private senders: Member[] = [];
@@ -156,6 +175,8 @@ export class VettedProvider extends JsonRpcProvider {
     private headsBusy: Promise<void> | null = null;
     /** Requests answered by the private endpoint vs public ones. */
     readonly usage = { public: 0, private: 0, privateFallbacks: 0, waitsForBudget: 0 };
+    private readonly feed: PushFeed;
+    private feedListeners = new Set<(e: FeedEvent) => void>();
 
     /**
      * @param chainId  the chain to serve
@@ -180,8 +201,19 @@ export class VettedProvider extends JsonRpcProvider {
         const { privateRpc: _omit, privateWs: _omitWs, ...rest } = o;
         this.opts = {
             privateFor: [], useWs: true, noTracking: false, timeoutMs: 15_000, maxPublicAttempts: 3, budgetWaitMs: 2000,
+            subscriptions: 'push', subscribePrivate: false, stallMs: 30_000, feedRetryMs: 30_000,
             ...rest,
         };
+        if (o.onFeed) this.feedListeners.add(o.onFeed);
+        this.feed = new PushFeed({
+            ready: () => this.booted,
+            candidates: () => this.feedCandidates(),
+            request: (method, params) => this.send(method, params),
+            emitBlock: n => { void this.emit('block', n); },
+            emitLog: (filter, log) => { void this.emit(filter, this._wrapLog(log as any, this._network)); },
+            pollMs: () => this.pollingInterval,
+            notify: e => { for (const f of this.feedListeners) { try { f(e); } catch { /* a listener's problem */ } } },
+        }, { stallMs: this.opts.stallMs, retryMs: this.opts.feedRetryMs, overlap: 2, span: 2000 });
         this.booted = this.init();
         this.booted.catch(() => { /* surfaced on first request */ });
     }
@@ -386,6 +418,38 @@ export class VettedProvider extends JsonRpcProvider {
             .filter(x => !x.isPrivate && (!kind || x.kind === kind) && x.ratings?.[profile]?.pass && now >= x.openUntil)
             .sort((a, b) => this.weight(b, n) - this.weight(a, n))[0];
         return best?.url ?? null;
+    }
+
+    // --- subscriptions ------------------------------------------------------------------
+
+    /**
+     * Websockets to subscribe on, best first: public ones rated `subscriber`
+     * (unrated ones too when there are no ratings), then yours — or yours first
+     * with `subscribePrivate`. A rated websocket that failed `subscriber` is left
+     * out: it was seen not to deliver.
+     */
+    private feedCandidates(): Array<{ url: string; private: boolean }> {
+        const n: Need = { method: 'eth_subscribe', profile: 'subscriber' };
+        const pub = this.members
+            .filter(x => !x.isPrivate && x.kind === 'ws' && (x.ratings ? x.ratings.subscriber?.pass : true))
+            .sort((a, b) => this.weight(b, n) - this.weight(a, n))
+            .map(x => ({ url: x.url, private: false }));
+        const mine = this.members.filter(x => x.isPrivate && x.kind === 'ws').map(x => ({ url: x.url, private: true }));
+        return this.opts.subscribePrivate ? [...mine, ...pub] : [...pub, ...mine];
+    }
+
+    /** Listen to subscription feed events (connected, failover, backfill, polling). Returns the remover. */
+    onFeed(listener: (e: FeedEvent) => void): () => void {
+        this.feedListeners.add(listener);
+        return () => { this.feedListeners.delete(listener); };
+    }
+
+    override _getSubscriber(sub: Subscription): Subscriber {
+        if (this.opts.subscriptions === 'push') {
+            if (sub.type === 'block') return feedSubscriber(this.feed, { kind: 'block' });
+            if (sub.type === 'event') return feedSubscriber(this.feed, { kind: 'logs', filter: cleanFilter(sub.filter as LogFilter) });
+        }
+        return super._getSubscriber(sub);
     }
 
     // --- sending ------------------------------------------------------------------------
@@ -606,6 +670,7 @@ export class VettedProvider extends JsonRpcProvider {
         return {
             usage: { ...this.usage },
             bestHead: this.bestHead,
+            feed: this.feed.state(),
             sendTo: (this.senders.length ? this.senders : this.members.filter(x => x.isPrivate)).map(x => x.url),
             endpoints: [...this.members, ...this.senders.filter(x => !this.members.includes(x))].map(x => ({
                 url: x.url, kind: x.kind, private: x.isPrivate, served: x.served, errors: x.errors,
@@ -618,7 +683,31 @@ export class VettedProvider extends JsonRpcProvider {
     }
 
     override destroy(): void {
+        this.feed.shutdown();
         for (const x of new Set([...this.members, ...this.senders])) x.client.close();
         super.destroy();
     }
+}
+
+/** The ethers Subscriber for one provider.on(): it only registers with the feed. */
+function feedSubscriber(feed: PushFeed, sub: { kind: 'block' } | { kind: 'logs'; filter: LogFilter }): Subscriber {
+    const key = {};
+    return {
+        start: () => feed.add(key, sub),
+        stop: () => feed.remove(key),
+        pause: () => feed.remove(key),
+        resume: () => feed.add(key, sub),
+    };
+}
+
+/** ethers' filter, minus empty fields (some nodes reject `address: undefined` / trailing nulls). */
+function cleanFilter(f: LogFilter): LogFilter {
+    const out: LogFilter = {};
+    if (f.address != null && !(Array.isArray(f.address) && f.address.length === 0)) out.address = f.address;
+    if (f.topics?.length) {
+        const t = [...f.topics];
+        while (t.length && t[t.length - 1] == null) t.pop();
+        if (t.length) out.topics = t;
+    }
+    return out;
 }

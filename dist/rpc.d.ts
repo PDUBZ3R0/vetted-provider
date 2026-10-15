@@ -65,6 +65,8 @@ export declare class WsClient implements Client {
     readonly subs: Map<string, (result: unknown) => void>;
     /** Time of the last frame of any kind from the server. */
     lastRx: number;
+    /** Called once when an open socket closes (not when connect() itself fails). */
+    onClose?: (why: string) => void;
     constructor(url: string);
     /** Open the socket. Resolves to an error string on failure, null on success. */
     connect(timeoutMs?: number): Promise<string | null>;
@@ -88,6 +90,8 @@ export declare class WsClient implements Client {
     }>;
     /** eth_subscribe; returns the subscription id or the failed reply. */
     subscribe(params: unknown[], onEvent: (r: unknown) => void): Promise<string | Reply>;
+    /** eth_unsubscribe. Drops the handler first, so a node that never answers can't keep the process alive. */
+    unsubscribe(id: string): Promise<Reply>;
     close(): void;
 }
 export declare const hex: (n: number | bigint) => string;

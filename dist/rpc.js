@@ -85,6 +85,8 @@ export class WsClient {
     subs = new Map();
     /** Time of the last frame of any kind from the server. */
     lastRx = 0;
+    /** Called once when an open socket closes (not when connect() itself fails). */
+    onClose;
     constructor(url) { this.url = url; }
     /** Open the socket. Resolves to an error string on failure, null on success. */
     connect(timeoutMs = 10_000) {
@@ -125,6 +127,8 @@ export class WsClient {
                 }
                 this.pending.clear();
                 this.batches.clear();
+                this.subs.clear();
+                this.onClose?.(this.closedWhy);
             };
             ws.onmessage = (ev) => { this.onMessage(typeof ev.data === 'string' ? ev.data : Buffer.from(ev.data).toString()); this.hold(); };
         });
@@ -236,7 +240,14 @@ export class WsClient {
         this.hold();
         return r.result;
     }
+    /** eth_unsubscribe. Drops the handler first, so a node that never answers can't keep the process alive. */
+    async unsubscribe(id) {
+        this.subs.delete(id);
+        this.hold();
+        return this.open ? this.call('eth_unsubscribe', [id]) : { transport: 'socket not open', ms: 0 };
+    }
     close() {
+        this.subs.clear();
         try {
             this.ws?.close();
         }

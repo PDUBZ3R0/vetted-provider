@@ -322,8 +322,8 @@ async function subscriptions(c: WsClient, ctx: Ctx, rep: Report): Promise<void> 
     W.lastHeadAgeSec = lastHead ? Math.round((Date.now() - lastHead) / 100) / 10 : null;
     // Silent death: heads came, then stopped for most of the window.
     W.died = W.heads > 0 && lastHead - t0 < ctx.wsWatchSec * 1000 * 0.5 && (Date.now() - lastHead) > ctx.wsWatchSec * 1000 * 0.4 || !c.open;
-    await c.call('eth_unsubscribe', [h]);
-    if (typeof l === 'string') await c.call('eth_unsubscribe', [l]);
+    await c.unsubscribe(h);
+    if (typeof l === 'string') await c.unsubscribe(l);
 }
 
 // --- runner -----------------------------------------------------------------------

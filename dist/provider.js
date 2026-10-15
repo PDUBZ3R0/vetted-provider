@@ -37,6 +37,11 @@
 // learns from it (lowers that endpoint's known limit, cools it down, opens its
 // circuit) and the request moves to the next candidate.
 //
+// SUBSCRIPTIONS. provider.on('block') and provider.on(filter) are real
+// eth_subscribe pushes on the best websocket rated `subscriber`, with silent-
+// socket detection, failover to the next endpoint, and a getLogs backfill of the
+// gap — see feed.ts. With no usable websocket they poll instead.
+//
 // Ratings come from `vetted-rpc vet <chainId>` (results/<chainId>.json). Without
 // them the pool still works on chainlist's unrated list, learning as it goes.
 // -----------------------------------------------------------------------------
@@ -45,6 +50,7 @@ import path from 'node:path';
 import { JsonRpcProvider, Network, keccak256 } from 'ethers';
 import { HttpClient, WsClient, isRateLimited, isMissingMethod, num } from "./rpc.js";
 import { discover } from "./chainlist.js";
+import { PushFeed } from "./feed.js";
 const CAPABILITY_RE = /block range|range (?:is )?too (?:large|wide)|exceed(?:s|ed)? .*(?:range|blocks)|too many (?:blocks|addresses|results|logs)|more than \d+ (?:results|logs)|response size|limit exceeded|query returned more|missing trie node|header not found|unknown block|state .*not available|historical state|pruned|beyond history|not (?:yet )?(?:synced|available)|please specify an address|address.*required|gas .*(?:cap|limit).*exceed|exceeds (?:block )?gas limit|execution timeout|-32701/i;
 const ALREADY_KNOWN = /already known|known transaction|already imported|nonce too low|replacement transaction underpriced/i;
 const HISTORY_DEPTH_GRACE = 64;
@@ -72,6 +78,8 @@ export class VettedProvider extends JsonRpcProvider {
     headsBusy = null;
     /** Requests answered by the private endpoint vs public ones. */
     usage = { public: 0, private: 0, privateFallbacks: 0, waitsForBudget: 0 };
+    feed;
+    feedListeners = new Set();
     /**
      * @param chainId  the chain to serve
      * @param privateOrOptions  your private RPC URL, or the options object (which may carry `privateRpc`)
@@ -95,8 +103,25 @@ export class VettedProvider extends JsonRpcProvider {
         const { privateRpc: _omit, privateWs: _omitWs, ...rest } = o;
         this.opts = {
             privateFor: [], useWs: true, noTracking: false, timeoutMs: 15_000, maxPublicAttempts: 3, budgetWaitMs: 2000,
+            subscriptions: 'push', subscribePrivate: false, stallMs: 30_000, feedRetryMs: 30_000,
             ...rest,
         };
+        if (o.onFeed)
+            this.feedListeners.add(o.onFeed);
+        this.feed = new PushFeed({
+            ready: () => this.booted,
+            candidates: () => this.feedCandidates(),
+            request: (method, params) => this.send(method, params),
+            emitBlock: n => { void this.emit('block', n); },
+            emitLog: (filter, log) => { void this.emit(filter, this._wrapLog(log, this._network)); },
+            pollMs: () => this.pollingInterval,
+            notify: e => { for (const f of this.feedListeners) {
+                try {
+                    f(e);
+                }
+                catch { /* a listener's problem */ }
+            } },
+        }, { stallMs: this.opts.stallMs, retryMs: this.opts.feedRetryMs, overlap: 2, span: 2000 });
         this.booted = this.init();
         this.booted.catch(() => { });
     }
@@ -337,6 +362,36 @@ export class VettedProvider extends JsonRpcProvider {
             .filter(x => !x.isPrivate && (!kind || x.kind === kind) && x.ratings?.[profile]?.pass && now >= x.openUntil)
             .sort((a, b) => this.weight(b, n) - this.weight(a, n))[0];
         return best?.url ?? null;
+    }
+    // --- subscriptions ------------------------------------------------------------------
+    /**
+     * Websockets to subscribe on, best first: public ones rated `subscriber`
+     * (unrated ones too when there are no ratings), then yours — or yours first
+     * with `subscribePrivate`. A rated websocket that failed `subscriber` is left
+     * out: it was seen not to deliver.
+     */
+    feedCandidates() {
+        const n = { method: 'eth_subscribe', profile: 'subscriber' };
+        const pub = this.members
+            .filter(x => !x.isPrivate && x.kind === 'ws' && (x.ratings ? x.ratings.subscriber?.pass : true))
+            .sort((a, b) => this.weight(b, n) - this.weight(a, n))
+            .map(x => ({ url: x.url, private: false }));
+        const mine = this.members.filter(x => x.isPrivate && x.kind === 'ws').map(x => ({ url: x.url, private: true }));
+        return this.opts.subscribePrivate ? [...mine, ...pub] : [...pub, ...mine];
+    }
+    /** Listen to subscription feed events (connected, failover, backfill, polling). Returns the remover. */
+    onFeed(listener) {
+        this.feedListeners.add(listener);
+        return () => { this.feedListeners.delete(listener); };
+    }
+    _getSubscriber(sub) {
+        if (this.opts.subscriptions === 'push') {
+            if (sub.type === 'block')
+                return feedSubscriber(this.feed, { kind: 'block' });
+            if (sub.type === 'event')
+                return feedSubscriber(this.feed, { kind: 'logs', filter: cleanFilter(sub.filter) });
+        }
+        return super._getSubscriber(sub);
     }
     // --- sending ------------------------------------------------------------------------
     async exchange(x, p) {
@@ -587,6 +642,7 @@ export class VettedProvider extends JsonRpcProvider {
         return {
             usage: { ...this.usage },
             bestHead: this.bestHead,
+            feed: this.feed.state(),
             sendTo: (this.senders.length ? this.senders : this.members.filter(x => x.isPrivate)).map(x => x.url),
             endpoints: [...this.members, ...this.senders.filter(x => !this.members.includes(x))].map(x => ({
                 url: x.url, kind: x.kind, private: x.isPrivate, served: x.served, errors: x.errors,
@@ -598,8 +654,33 @@ export class VettedProvider extends JsonRpcProvider {
         };
     }
     destroy() {
+        this.feed.shutdown();
         for (const x of new Set([...this.members, ...this.senders]))
             x.client.close();
         super.destroy();
     }
+}
+/** The ethers Subscriber for one provider.on(): it only registers with the feed. */
+function feedSubscriber(feed, sub) {
+    const key = {};
+    return {
+        start: () => feed.add(key, sub),
+        stop: () => feed.remove(key),
+        pause: () => feed.remove(key),
+        resume: () => feed.add(key, sub),
+    };
+}
+/** ethers' filter, minus empty fields (some nodes reject `address: undefined` / trailing nulls). */
+function cleanFilter(f) {
+    const out = {};
+    if (f.address != null && !(Array.isArray(f.address) && f.address.length === 0))
+        out.address = f.address;
+    if (f.topics?.length) {
+        const t = [...f.topics];
+        while (t.length && t[t.length - 1] == null)
+            t.pop();
+        if (t.length)
+            out.topics = t;
+    }
+    return out;
 }
