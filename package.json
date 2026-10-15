@@ -1,0 +1,41 @@
+{
+  "name": "vetted-rpc",
+  "version": "0.1.0",
+  "description": "Rate every public RPC for an EVM chain (getLogs limits, revert data, gas cap, rate limits, latency, WebSocket health) and pick the best one for the job.",
+  "type": "module",
+  "bin": {
+    "vetrpc": "./src/cli.ts"
+  },
+  "scripts": {
+    "vet": "bash ./vet.sh",
+    "best": "node --experimental-strip-types --disable-warning=ExperimentalWarning src/cli.ts best",
+    "test": "node --experimental-strip-types --disable-warning=ExperimentalWarning test/mock.test.ts && node --experimental-strip-types --disable-warning=ExperimentalWarning test/provider.test.ts"
+  },
+  "engines": {
+    "node": ">=22.6"
+  },
+  "license": "MIT",
+  "keywords": [
+    "ethereum",
+    "evm",
+    "rpc",
+    "json-rpc",
+    "chainlist",
+    "ethers",
+    "getLogs"
+  ],
+  "devDependencies": {
+    "ethers": "^6.13.4"
+  },
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "peerDependencies": {
+    "ethers": "^6.13.0"
+  },
+  "peerDependenciesMeta": {
+    "ethers": {
+      "optional": true
+    }
+  }
+}
