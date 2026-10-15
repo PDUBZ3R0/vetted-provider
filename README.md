@@ -59,7 +59,19 @@ A drop-in `JsonRpcProvider`: it overrides only `_send`, so anything that accepts
 
 1. **What does it need?** A 40k-block `eth_getLogs` needs an endpoint rated for that range, and an address-less one needs topic-only support. An `eth_call` needs revert data and enough gas cap; a state override needs override support. A read 500k blocks back needs that much history. `debug_` / `trace_` methods need endpoints that have them. A call pinned to block N skips endpoints whose head hasn't reached N.
 2. **Which public endpoints can do it, are healthy, and have rate budget?** It picks among the best few, weighted by rating and live latency, so load spreads instead of piling onto one. If every capable endpoint is out of budget, it waits briefly for a refill rather than spend a private request.
-3. **The private endpoint** is used only when no public endpoint can do the job, as the fallback when public attempts fail, or for methods in `privateFor`. That defaults to `eth_sendRawTransaction`, which goes to private *and* the best publics at once, because landing a transaction is worth one extra request.
+3. **The private endpoint** is used only when no public endpoint can do the job, as the fallback when public attempts fail, or for read methods you list in `privateFor`.
+
+**Transactions are routed separately.** `eth_sendRawTransaction` and the other send methods (`…Conditional`, `…Sync`, `eth_sendBundle`, `eth_sendPrivateTransaction`) go to `sendRpc` and **only** there:
+
+| configured | sends go to |
+|---|---|
+| `sendRpc` (one URL or several) | those endpoints, all at once, first success wins. Never also to a public endpoint, and no public retry if they fail |
+| no `sendRpc`, `privateRpc` set | the private endpoint alone |
+| neither | the best-rated `trader` public endpoint, then the next if it can't be reached |
+
+Set `sendRpc` to the sequencer on an FCFS chain, or to a private relay or builder on a mempool chain. Sending only there matters on mempool chains: handing the transaction to a public endpoint as well would put it in the public mempool and defeat the relay. `sendRpc` is never used for reads, since sequencer and relay endpoints usually accept nothing else.
+
+With a private relay, a pending transaction isn't in the public mempool, so `eth_getTransactionCount(address, 'pending')` from a public endpoint won't count it. Keep nonces locally (ethers' `NonceManager`) when sending several in a row.
 
 The provider learns as it runs:
 
@@ -72,7 +84,7 @@ The provider learns as it runs:
 const p = new VettedProvider(999, {
   privateRpc: process.env.PAID_RPC,   // or pass the URL as the second argument and options third
   ratings: 'results',                 // results dir, a results file, or the parsed object (default ./results)
-  privateFor: ['eth_sendRawTransaction'],
+  sendRpc: 'https://sequencer.example',   // where transactions go (default: privateRpc, else the best trader)
   privateRps: 25,                     // budget for the paid endpoint (default unlimited)
   budgetWaitMs: 2000,                 // wait this long for a public rate budget before using private (0 = don't wait)
   noTracking: true,                   // skip endpoints chainlist marks as tracking users
@@ -97,4 +109,5 @@ Runs against mock JSON-RPC nodes (HTTP and WebSocket) with known limits. Every l
 ## License
 
 MIT
+
 # vetted-provider

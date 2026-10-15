@@ -20,8 +20,16 @@
 //      moment for a refill rather than spend private requests.
 //   3. The PRIVATE endpoint is used only when no public one can do the job, as
 //      the fallback when public attempts fail, or for methods listed in
-//      `privateFor` (default: eth_sendRawTransaction, sent to private AND the
-//      best publics at once — duplicates come back "already known").
+//      `privateFor` (sent to private AND the best publics at once).
+//
+// TRANSACTIONS are not routed like reads. eth_sendRawTransaction (and the other
+// send methods) go to `sendRpc` — the sequencer of an FCFS chain, a private
+// relay on a mempool chain — and ONLY there: on a mempool chain, also handing
+// the transaction to a public endpoint would put it in the public mempool and
+// defeat the relay. Without `sendRpc`, sends go to the private endpoint; without
+// either, to the best-rated `trader` public endpoint (falling back to the next).
+// `sendRpc` is never used for reads — sequencer and relay endpoints usually
+// accept nothing but sends.
 //
 // Answers are classified: a revert or bad params is a real answer and goes
 // straight back; "range too large", "method not found", "missing trie node",
@@ -46,7 +54,14 @@ export type VettedOptions = {
     privateRpc?: string | null;
     /** Ratings: a results file, a directory holding <chainId>.json, or the parsed object. Default ./results. */
     ratings?: string | { endpoints: Array<Report & { ratings: Record<Profile, Rating> }> };
-    /** Methods always sent to the private endpoint too (in parallel with publics). Default ['eth_sendRawTransaction']. */
+    /**
+     * Where transactions are sent: an FCFS chain's sequencer, a private relay on a
+     * mempool chain, a builder. Several are sent to at once (first success wins).
+     * Sends go ONLY here — never also to public endpoints, never retried on them.
+     * Default: privateRpc if given, else the best-rated `trader` public endpoint.
+     */
+    sendRpc?: string | string[];
+    /** Read methods always sent to the private endpoint too, in parallel with the best publics. Default none. */
     privateFor?: string[];
     /** Requests per second allowed on the private endpoint (default unlimited). */
     privateRps?: number;
@@ -113,6 +128,11 @@ type Member = {
 const CAPABILITY_RE = /block range|range (?:is )?too (?:large|wide)|exceed(?:s|ed)? .*(?:range|blocks)|too many (?:blocks|addresses|results|logs)|more than \d+ (?:results|logs)|response size|limit exceeded|query returned more|missing trie node|header not found|unknown block|state .*not available|historical state|pruned|beyond history|not (?:yet )?(?:synced|available)|please specify an address|address.*required|gas .*(?:cap|limit).*exceed|exceeds (?:block )?gas limit|execution timeout|-32701/i;
 const ALREADY_KNOWN = /already known|known transaction|already imported|nonce too low|replacement transaction underpriced/i;
 const HISTORY_DEPTH_GRACE = 64;
+/** Methods that submit a transaction: routed to sendRpc, never load-balanced. */
+const SEND_METHODS = new Set([
+    'eth_sendRawTransaction', 'eth_sendRawTransactionSync', 'eth_sendRawTransactionConditional',
+    'eth_sendPrivateTransaction', 'eth_sendPrivateRawTransaction', 'eth_sendBundle',
+]);
 
 const sleep = (ms: number) => new Promise(r => setTimeout(r, ms));
 const parseBlock = (t: unknown): number | undefined => typeof t === 'string' && /^0x[0-9a-f]+$/i.test(t) ? Number(BigInt(t)) : typeof t === 'number' ? t : undefined;
@@ -122,6 +142,8 @@ export class VettedProvider extends JsonRpcProvider {
     readonly privateRpc: string | null;
     private readonly opts: Required<Omit<VettedOptions, 'ratings' | 'onRoute' | 'privateRps' | 'privateRpc'>> & Pick<VettedOptions, 'ratings' | 'onRoute' | 'privateRps'>;
     private members: Member[] = [];
+    /** Explicit transaction targets (sendRpc). Not part of the read pool. */
+    private senders: Member[] = [];
     private ready: Promise<void>;
     private bestHead: number | null = null;
     /** Filter id -> the member that created it: eth_getFilterChanges / eth_uninstallFilter must go back there. */
@@ -152,7 +174,7 @@ export class VettedProvider extends JsonRpcProvider {
         this.privateRpc = privateRpc;
         const { privateRpc: _omit, ...rest } = o;
         this.opts = {
-            privateFor: ['eth_sendRawTransaction'], useWs: true, noTracking: false, timeoutMs: 15_000, maxPublicAttempts: 3, budgetWaitMs: 2000,
+            privateFor: [], useWs: true, noTracking: false, timeoutMs: 15_000, maxPublicAttempts: 3, budgetWaitMs: 2000,
             ...rest,
         };
         this.ready = this.init();
@@ -181,6 +203,13 @@ export class VettedProvider extends JsonRpcProvider {
             }
         }
         if (this.privateRpc) this.add(this.privateRpc, /^wss?:/i.test(this.privateRpc) ? 'ws' : 'http', true);
+        const send = this.opts.sendRpc == null ? [] : Array.isArray(this.opts.sendRpc) ? this.opts.sendRpc : [this.opts.sendRpc];
+        for (const url of [...new Set(send.filter(Boolean))]) {
+            const pv = this.privateMember();
+            if (pv && pv.url === url) { this.senders.push(pv); continue; }
+            this.add(url, /^wss?:/i.test(url) ? 'ws' : 'http', true);
+            this.senders.push(this.members.pop()!);   // a send target, not a read endpoint
+        }
         if (!this.members.length) throw new Error(`VettedProvider: no usable endpoint for chain ${this.chainId} (no ratings, chainlist unreachable, no private RPC)`);
         await this.refreshHeads();
     }
@@ -406,6 +435,7 @@ export class VettedProvider extends JsonRpcProvider {
         await this.ready;
         if (Date.now() - this.headsAt > 30_000) void this.refreshHeads();
         const n = this.needOf(p);
+        if (SEND_METHODS.has(n.method)) return this.submit(p, n);
         if (this.opts.privateFor.includes(n.method)) return this.fanOut(p, n);
         if (/^eth_(getFilterChanges|getFilterLogs|uninstallFilter)$/.test(n.method)) return this.sticky(p, n);
         const tried = new Set<Member>();
@@ -452,10 +482,56 @@ export class VettedProvider extends JsonRpcProvider {
     }
 
     /**
-     * Same request to the private endpoint and the best publics at once — for
-     * sends, where landing fast matters more than one extra request. The first
-     * success wins; "already known" from a later endpoint is success too, and
-     * resolves to the transaction hash.
+     * A transaction. Explicit sendRpc targets (or the private endpoint) get it in
+     * parallel, and nothing else does — a failure there is returned, never retried
+     * on a public endpoint. With neither, the best `trader` publics are tried in
+     * turn until one accepts it.
+     */
+    private async submit(p: JsonRpcPayload, n: Need): Promise<JsonRpcResult | JsonRpcError> {
+        const pv = this.privateMember();
+        const fixed = this.senders.length ? this.senders : pv ? [pv] : [];
+        const fire = async (x: Member) => {
+            const r = await this.exchange(x, p);
+            const outcome = this.judge(x, n, r);
+            this.opts.onRoute?.({ method: n.method, url: x.url, private: x.isPrivate, outcome, ms: Math.round(r.ms), detail: r.error?.message ?? r.transport });
+            if (x.isPrivate) this.usage.private++; else this.usage.public++;
+            return r;
+        };
+        if (fixed.length) {
+            const replies = await Promise.all(fixed.map(fire));
+            return this.firstAccepted(p, n, replies);
+        }
+        const tried = new Set<Member>();
+        const replies: Reply[] = [];
+        for (let i = 0; i < this.opts.maxPublicAttempts; i++) {
+            const now = Date.now();
+            const x = this.members.filter(m => !m.isPrivate && !tried.has(m) && this.available(m, now) && this.can(m, n))
+                .sort((a, b) => this.weight(b, n) - this.weight(a, n))[0];
+            if (!x) break;
+            tried.add(x);
+            const r = await fire(x);
+            replies.push(r);
+            // Accepted, or refused for a reason another endpoint would repeat (bad nonce,
+            // underpriced, invalid): stop. Only transport / rate-limit failures move on.
+            if (!r.transport && !isRateLimited(r)) return this.firstAccepted(p, n, replies);
+        }
+        if (!replies.length) return { id: p.id, error: { code: -32603, message: `VettedProvider: no endpoint to send ${n.method} to` } } as JsonRpcError;
+        return this.firstAccepted(p, n, replies);
+    }
+
+    /** First success; "already known" counts as success and resolves to the transaction hash. */
+    private firstAccepted(p: JsonRpcPayload, n: Need, replies: Reply[]): JsonRpcResult | JsonRpcError {
+        const good = replies.find(r => !r.error && !r.transport);
+        if (good) return this.toResult(p, good);
+        if (n.method === 'eth_sendRawTransaction' && replies.some(r => r.error && ALREADY_KNOWN.test(r.error.message))) {
+            return { id: p.id, result: keccak256((p.params as string[])[0]) } as JsonRpcResult;
+        }
+        return this.toResult(p, replies.find(r => r.error) ?? replies[0]);
+    }
+
+    /**
+     * Same request to the private endpoint and the best publics at once (methods in
+     * privateFor). The first success wins.
      */
     private async fanOut(p: JsonRpcPayload, n: Need): Promise<JsonRpcResult | JsonRpcError> {
         await this.ready;
@@ -472,12 +548,7 @@ export class VettedProvider extends JsonRpcProvider {
             if (x.isPrivate) this.usage.private++; else this.usage.public++;
             return r;
         }));
-        const good = replies.find(r => !r.error && !r.transport);
-        if (good) return this.toResult(p, good);
-        if (n.method === 'eth_sendRawTransaction' && replies.some(r => r.error && ALREADY_KNOWN.test(r.error.message))) {
-            return { id: p.id, result: keccak256((p.params as string[])[0]) } as JsonRpcResult;
-        }
-        return this.toResult(p, replies.find(r => r.error) ?? replies[0]);
+        return this.firstAccepted(p, n, replies);
     }
 
     override async _send(payload: JsonRpcPayload | JsonRpcPayload[]): Promise<Array<JsonRpcResult | JsonRpcError>> {
@@ -493,7 +564,8 @@ export class VettedProvider extends JsonRpcProvider {
         return {
             usage: { ...this.usage },
             bestHead: this.bestHead,
-            endpoints: this.members.map(x => ({
+            sendTo: (this.senders.length ? this.senders : this.members.filter(x => x.isPrivate)).map(x => x.url),
+            endpoints: [...this.members, ...this.senders.filter(x => !this.members.includes(x))].map(x => ({
                 url: x.url, kind: x.kind, private: x.isPrivate, served: x.served, errors: x.errors,
                 ewmaMs: Math.round(x.ewmaMs), head: x.head,
                 state: now < x.openUntil ? 'down' : now < x.coolUntil ? 'cooling' : 'ok',
@@ -504,7 +576,7 @@ export class VettedProvider extends JsonRpcProvider {
     }
 
     override destroy(): void {
-        for (const x of this.members) x.client.close();
+        for (const x of new Set([...this.members, ...this.senders])) x.client.close();
         super.destroy();
     }
 }

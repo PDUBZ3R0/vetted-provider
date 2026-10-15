@@ -93,6 +93,56 @@ reset();
     narrow.o.maxRange = 2000;
 }
 
+console.log('\ntransactions go to sendRpc, and only there');
+{
+    const seq = new MockNode({ ...base }), relay = new MockNode({ ...base });
+    await seq.start(); await relay.start();
+    const all = [narrow, wide, priv, seq, relay];
+    const zero = () => { for (const m of all) m.requests = 0; };
+    const counts = () => all.map(m => m.requests);
+    const tx = '0x02f8';
+    const ratings = { endpoints };
+    const warm = async (x: VettedProvider) => { await x.send('eth_blockNumber', []); zero(); };
+
+    let x = new VettedProvider(999, { privateRpc: priv.url, sendRpc: seq.url, ratings });
+    await warm(x);
+    await x.send('eth_sendRawTransaction', [tx]);
+    check(seq.requests === 1 && narrow.requests + wide.requests + priv.requests === 0, 'sendRpc set: the sequencer alone gets it — not private, not public', counts());
+    zero();
+    for (let i = 0; i < 10; i++) await x.send('eth_blockNumber', []);
+    check(seq.requests === 0, 'reads never go to sendRpc', counts());
+    check(x.stats().sendTo[0] === seq.url, 'stats() names the send target', x.stats().sendTo);
+    x.destroy();
+
+    x = new VettedProvider(999, { sendRpc: [seq.url, relay.url], ratings });
+    await warm(x);
+    await x.send('eth_sendRawTransaction', [tx]);
+    check(seq.requests === 1 && relay.requests === 1 && narrow.requests + wide.requests === 0, 'two send targets: both get it at once, publics none', counts());
+    x.destroy();
+
+    x = new VettedProvider(999, priv.url, { ratings });
+    await warm(x);
+    await x.send('eth_sendRawTransaction', [tx]);
+    check(priv.requests === 1 && narrow.requests + wide.requests === 0, 'no sendRpc, private given: private alone (no public mempool leak)', counts());
+    x.destroy();
+
+    x = new VettedProvider(999, { ratings });
+    await warm(x);
+    await x.send('eth_sendRawTransaction', [tx]);
+    check(narrow.requests + wide.requests === 1, 'neither: exactly one public endpoint, the best trader', counts());
+    x.destroy();
+
+    x = new VettedProvider(999, { sendRpc: 'http://127.0.0.1:1', ratings });
+    await warm(x);
+    let err: any = null;
+    try { await x.send('eth_sendRawTransaction', [tx]); } catch (e) { err = e; }
+    check(err != null && narrow.requests + wide.requests + priv.requests === 0, 'sendRpc down: the error comes back, nothing falls back to public', { err: err?.shortMessage ?? err?.message, counts: counts() });
+    x.destroy();
+
+    await seq.stop(); await relay.stop();
+    zero();
+}
+
 console.log('\nfilters stay on the node that holds them');
 {
     const id = await p.send('eth_newFilter', [{ address: '0x' + 'a'.repeat(40) }]);
@@ -121,11 +171,6 @@ reset();
     check(p.usage.privateFallbacks >= 0, 'usage counted', p.usage);
 }
 
-console.log('\nsends go everywhere useful at once');
-{
-    const hash = await p.send('eth_sendRawTransaction', ['0x02f8']);
-    check(typeof hash === 'string' && priv.requests >= 1, 'private included for eth_sendRawTransaction', hash);
-}
 
 console.log('\nconstructor forms');
 {
