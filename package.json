@@ -23,7 +23,13 @@
     "json-rpc",
     "chainlist",
     "ethers",
-    "getLogs"
+    "getLogs",
+    "load-balancing",
+    "performance",
+    "ethers",
+    "provider",
+    "websockets",
+    "ws"
   ],
   "devDependencies": {
     "ethers": "^6.13.4",
