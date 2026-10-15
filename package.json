@@ -1,5 +1,5 @@
 {
-  "name": "vetted-rpc",
+  "name": "vetted-provider",
   "version": "0.1.0",
   "description": "Rate every public RPC for an EVM chain (getLogs limits, revert data, gas cap, rate limits, latency, WebSocket health) and pick the best one for the job.",
   "type": "module",
