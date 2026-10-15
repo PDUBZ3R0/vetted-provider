@@ -1,6 +1,6 @@
 {
   "name": "vetted-provider",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Ethers provider that rates every public RPC for an EVM chain (getLogs limits, revert data, gas cap, rate limits, latency, WebSocket health) and pick the best one for the job.",
   "type": "module",
   "bin": {
