@@ -46,9 +46,9 @@ const numOpt = (f, d) => { const v = opt(f); if (v == null)
 function die(msg) { console.error(msg); process.exit(1); }
 const log = (s) => console.error(s);
 const usage = () => die('usage:\n' +
-    '  vetted-rpc vet <chainId> [--rpc <url>]... [--only http|ws] [--concurrency n] [--max-rps n] [--ws-watch sec]\n' +
+    '  vetrpc vet <chainId> [--rpc <url>]... [--only http|ws] [--concurrency n] [--max-rps n] [--ws-watch sec]\n' +
     '                           [--max-lag blocks] [--skip logs,calls,...] [--limit n] [--from label] [--out dir]\n' +
-    '  vetted-rpc best <chainId> [--profile scanner|trader|reader|subscriber] [--kind http|ws] [--n count] [--out dir]');
+    '  vetrpc best <chainId> [--profile scanner|trader|reader|subscriber] [--kind http|ws] [--n count] [--out dir]');
 const chainId = Number(args[1]);
 if (!cmd || !Number.isInteger(chainId) || chainId <= 0)
     usage();
@@ -66,7 +66,7 @@ async function vet() {
     const skip = Object.fromEntries((opt('--skip') ?? '').split(',').filter(Boolean).map(s => [s.trim(), true]));
     if (maxRps <= 0)
         skip.rate = true;
-    log(`vetted-rpc ${VERSION} — chain ${chainId}, from ${from}`);
+    log(`vetted-provider ${VERSION} — chain ${chainId}, from ${from}`);
     const info = await discover(chainId, { extra: opts('--rpc') });
     let eps = info.endpoints.filter(e => !only || e.kind === only);
     if (limit > 0)
@@ -94,7 +94,7 @@ async function vet() {
     const endpoints = reports.map(r => ({ ...r, ratings: rateAll(r, { maxLag }) }));
     endpoints.sort((a, b) => bestScore(b.ratings) - bestScore(a.ratings));
     const results = {
-        tool: `vetted-rpc ${VERSION}`, chainId, name: info.name, testedAt: new Date().toISOString(), from,
+        tool: `vetted-provider ${VERSION}`, chainId, name: info.name, testedAt: new Date().toISOString(), from,
         options: { maxRps, wsWatchSec, maxLag, only: only ?? 'all', skip: Object.keys(skip), sample },
         endpoints,
     };
@@ -209,7 +209,7 @@ function printRecommendation(res) {
 // --- best ---------------------------------------------------------------------------
 function best() {
     if (!fs.existsSync(resultsFile))
-        die(`no ratings for chain ${chainId} at ${resultsFile} — run: vetted-rpc vet ${chainId}`);
+        die(`no ratings for chain ${chainId} at ${resultsFile} — run: vetrpc vet ${chainId}`);
     const res = JSON.parse(fs.readFileSync(resultsFile, 'utf8'));
     const profile = (opt('--profile') ?? 'trader');
     if (!PROFILES.includes(profile))

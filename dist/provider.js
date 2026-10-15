@@ -42,7 +42,7 @@
 // socket detection, failover to the next endpoint, and a getLogs backfill of the
 // gap — see feed.ts. With no usable websocket they poll instead.
 //
-// Ratings come from `vetted-rpc vet <chainId>` (results/<chainId>.json). Without
+// Ratings come from `vetrpc vet <chainId>` (results/<chainId>.json). Without
 // them the pool still works on chainlist's unrated list, learning as it goes.
 // -----------------------------------------------------------------------------
 import fs from 'node:fs';
@@ -104,7 +104,7 @@ export class VettedProvider extends JsonRpcProvider {
         // polling: provider.on(filter) polls stateless eth_getLogs instead of eth_newFilter +
         // eth_getFilterChanges — a filter id lives on ONE node, and a pool answers each
         // request from wherever is best, so filter-id subscriptions would break.
-        super(privateRpc ?? 'http://vetted-rpc.invalid', network, { staticNetwork: network, batchMaxCount: 1, polling: true });
+        super(privateRpc ?? 'http://vetted-provider.invalid', network, { staticNetwork: network, batchMaxCount: 1, polling: true });
         this.chainId = chainId;
         this.privateRpc = privateRpc;
         this.privateWs = o.privateWs || null;
