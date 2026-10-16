@@ -129,7 +129,13 @@ type Member = {
     rep?: Report;
     ratings?: Record<Profile, Rating>;
     /** Limits learned at runtime override the rated ones (only ever downward). */
-    learned: { maxRange?: number; maxAddresses?: number; topicOnly?: boolean; gasCap?: number; stateDepth?: number; revertData?: boolean; missing: Set<string> };
+    learned: {
+        maxRange?: number; maxAddresses?: number; topicOnly?: boolean; gasCap?: number; stateDepth?: number; revertData?: boolean; missing: Set<string>;
+        /** getLogs starting deeper than this many blocks below the head are refused as paid-only (an upper bound, tightened as it refuses more). */
+        logsDepth?: number;
+        /** Methods it refuses behind a paywall when the data is old (by-hash lookups carry no block to judge age by). */
+        gated?: Set<string>;
+    };
     // health
     ewmaMs: number;
     head: number | null;
@@ -157,7 +163,21 @@ const CAPABILITY_RE = /unknown state|first available state|^\s*block\s+(?:number
  */
 const LAGGING_RE = /^\s*block\s+(?:number\s+)?#?\d+|block (?:not found|is not available|not yet|.*(?:ahead|beyond|greater than|future))|unknown block|header not found/i;
 const STATE_RE = /unknown state|first available state|state (?:is )?not available|missing trie node|historical state|pruned/i;
-const ALREADY_KNOWN = /already known|known transaction|already imported|nonce too low|replacement transaction underpriced/i;
+/**
+ * History behind a paywall: the endpoint serves recent data but refuses older
+ * reads unless you pay ("Archive requests require a personal token" —
+ * publicnode; "upgrade your plan", "requires an API key"). Another endpoint may
+ * serve the same request for free, so this is a capability failure, and the
+ * endpoint is kept off that kind of request for the rest of the run.
+ */
+const GATED_RE = /archive (?:requests?|data|access|queries|calls|state|nodes?)\b.*\b(?:requires?|need|not (?:supported|available|allowed)|unavailable|disabled)|requires? (?:a |an )?(?:personal|api|access) (?:token|key)|requires? (?:a |an )?(?:paid|premium) (?:plan|subscription|tier)|personal token|upgrade (?:your )?(?:plan|tier|account)|(?:paid|premium) (?:plan|tier) (?:is )?required|api key (?:is )?required/i;
+/**
+ * The node already has THIS transaction (same hash): the send succeeded somewhere.
+ * Not "nonce too low" or "replacement transaction underpriced" — those mean a
+ * DIFFERENT transaction holds the nonce, and treating them as success would leave
+ * the caller waiting on a hash that never mines.
+ */
+const ALREADY_KNOWN = /already known|known transaction|already imported/i;
 const HISTORY_DEPTH_GRACE = 64;
 /** Methods that submit a transaction: routed to sendRpc, never load-balanced. */
 const SEND_METHODS = new Set([
@@ -345,6 +365,7 @@ export class VettedProvider extends JsonRpcProvider {
     /** Can member `x` do `need`, from its ratings and what it has taught us? undefined = unknown (allowed, ranked lower). */
     private can(x: Member, n: Need): boolean {
         if (x.learned.missing.has(n.method)) return false;
+        if (x.learned.gated?.has(n.method) && n.block == null && n.logsRange == null) return false;
         const L = x.rep?.logs, C = x.rep?.call, H = x.rep?.history;
         if (n.method in (x.rep?.methods ?? {}) && x.rep!.methods![n.method] === false) return false;
         if (n.block != null && x.head != null && Date.now() - x.headAt < 10_000 && x.head < n.block) return false;   // not caught up to the block asked for
@@ -355,6 +376,7 @@ export class VettedProvider extends JsonRpcProvider {
             if (n.logsAddrs && addrs != null && n.logsAddrs > addrs) return false;
             if (n.topicOnly && (x.learned.topicOnly ?? L?.topicOnly) === false) return false;
             if (n.fromBlock != null && this.bestHead != null && this.bestHead - n.fromBlock > 1_000_000 && L?.oldLogs === false) return false;
+            if (n.fromBlock != null && this.bestHead != null && x.learned.logsDepth != null && this.bestHead - n.fromBlock > x.learned.logsDepth) return false;
         }
         if (n.gas != null) { const cap = x.learned.gasCap ?? C?.gasCap; if (cap != null && n.gas > cap) return false; }
         if (n.stateOverride && C?.stateOverride === false) return false;
@@ -517,6 +539,16 @@ export class VettedProvider extends JsonRpcProvider {
         }
         if (isMissingMethod(r)) { x.learned.missing.add(n.method); return 'capability'; }
         const msg = `${r.error.message} ${typeof r.error.data === 'string' ? r.error.data : ''}`;
+        if (GATED_RE.test(msg) && !/revert/i.test(msg)) {   // a contract's revert reason is an answer, whatever it says
+            // Paid-only history: learn how deep it goes (pinned reads, logs) or, for
+            // by-hash lookups that carry no block, keep the method off this endpoint.
+            x.errors++;
+            const depth = (b: number) => Math.max(0, (this.bestHead ?? b) - b - 1);
+            if (n.logsRange != null && n.fromBlock != null) x.learned.logsDepth = Math.min(x.learned.logsDepth ?? Infinity, depth(n.fromBlock));
+            else if (n.block != null) x.learned.stateDepth = Math.min(x.learned.stateDepth ?? Infinity, depth(n.block));
+            else (x.learned.gated ??= new Set()).add(n.method);
+            return 'capability';
+        }
         if (CAPABILITY_RE.test(msg) || r.error.code === -32005) {
             x.errors++;
             if (n.logsRange != null) {
@@ -530,6 +562,10 @@ export class VettedProvider extends JsonRpcProvider {
                 if (first && Number(first[1]) > n.block) {
                     // Keeps state from block `first` on: how deep that is, from the head.
                     x.learned.stateDepth = Math.min(x.learned.stateDepth ?? Infinity, Math.max(0, (this.bestHead ?? Number(first[1])) - Number(first[1])));
+                } else if (!first && STATE_RE.test(msg) && x.head != null && x.head >= n.block && this.bestHead != null) {
+                    // No number in the message, but this node was already past the block:
+                    // it is not behind, it no longer has that state (Sonic: latest only).
+                    x.learned.stateDepth = Math.min(x.learned.stateDepth ?? Infinity, Math.max(0, this.bestHead - n.block - 1));
                 } else if (LAGGING_RE.test(msg) || (first && Number(first[1]) <= n.block)
                     || (STATE_RE.test(msg) && (this.bestHead == null || this.bestHead - n.block <= HISTORY_DEPTH_GRACE))) {
                     // Behind: it hasn't reached the block yet. Keep it off that block for a while.
@@ -710,7 +746,7 @@ export class VettedProvider extends JsonRpcProvider {
                 ewmaMs: Math.round(x.ewmaMs), head: x.head,
                 state: now < x.openUntil ? 'down' : now < x.coolUntil ? 'cooling' : 'ok',
                 rps: Number.isFinite(x.rps) ? +x.rps.toFixed(1) : null,
-                learned: { ...x.learned, missing: [...x.learned.missing] },
+                learned: { ...x.learned, missing: [...x.learned.missing], gated: x.learned.gated ? [...x.learned.gated] : undefined },
             })),
         };
     }

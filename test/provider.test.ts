@@ -221,7 +221,7 @@ console.log('\nlagging and latest-state-only nodes (Sonic)');
     // archive node. Reads pinned near the head must all succeed, and the pool must
     // learn to keep them away from the first two.
     const sb: MockOpts = { ...base, maxRange: 10_000, topicOnly: true, sonicState: true, stateDepth: 100_000_000, oldLogs: true };
-    const latest = new MockNode({ ...sb, stateDepth: 0 });
+    const latest = new MockNode({ ...sb, stateDepth: 0, sonicStateNoNumber: true });   // the message as Sonic sends it: no number
     const behind = new MockNode({ ...sb, lagBlocks: 3 });
     const good = new MockNode({ ...sb });
     for (const m of [latest, behind, good]) await m.start();
@@ -257,6 +257,51 @@ console.log('\nlagging and latest-state-only nodes (Sonic)');
     check(beh.head != null && beh.head < h, 'learned: that node is behind', { head: beh.head, best: h });
     q.destroy();
     for (const m of [latest, behind, good]) await m.stop();
+}
+
+console.log('\npaid-only history (publicnode: "Archive requests require a personal token")');
+{
+    // One node serves recent data free and refuses older reads unless you pay;
+    // the other serves everything. Old reads must fail over, and the pool must
+    // learn to keep them off the paywalled node — while it still gets recent ones.
+    const gb: MockOpts = { ...base, maxRange: 100_000, topicOnly: true, maxAddresses: 1000, stateDepth: 100_000_000, oldLogs: true };
+    const walled = new MockNode({ ...gb, gatedDepth: 128 });
+    const free = new MockNode({ ...gb });
+    for (const m of [walled, free]) await m.start();
+    const eps = [];
+    for (const m of [walled, free]) {
+        const r = await vetEndpoint(new HttpClient(m.url), ctx, { source: 'test' }, { rate: true });
+        r.rate = { cleanRps: 200, limitedAt: null, sent: 0 };
+        r.headLag = 0;
+        eps.push({ ...r, ratings: rateAll(r, { maxLag: 5 }) });
+    }
+    // Rated alike (a vet probes near the head, where the paywall does not show),
+    // so routing alone does not keep old reads off the walled node.
+    eps[0] = { ...eps[1], url: walled.url };
+    const q = new VettedProvider(999, { ratings: { endpoints: eps }, maxPublicAttempts: 3 });
+    const h = await q.getBlockNumber();
+    let ok = 0; const failed: string[] = [];
+    for (let i = 0; i < 30; i++) {
+        try { const t = await q.send('eth_getTransactionByHash', ['0x' + i.toString(16).padStart(62, '0') + 'aa']); if (t?.from) ok++; } catch (e) { failed.push((e as Error).message.slice(0, 70)); }
+    }
+    check(ok === 30, 'every old transaction lookup answered (paywall error retried elsewhere, never returned)', failed[0] ?? ok);
+    const w = () => q.stats().endpoints.find(e => e.url === walled.url)!;
+    check((w().learned.gated as unknown as string[] ?? []).includes('eth_getTransactionByHash'), 'learned: that node paywalls by-hash lookups', w().learned);
+    walled.requests = 0;
+    for (let i = 0; i < 10; i++) await q.send('eth_getTransactionByHash', ['0x' + 'f'.repeat(62) + 'aa']);
+    check(walled.requests === 0, 'no more by-hash lookups sent to it', walled.requests);
+
+    ok = 0; failed.length = 0;
+    for (let i = 0; i < 20; i++) {
+        try { await q.send('eth_getLogs', [{ address: '0x' + 'a'.repeat(40), fromBlock: '0x' + (h - 50_000).toString(16), toBlock: '0x' + (h - 49_990).toString(16) }]); ok++; } catch (e) { failed.push((e as Error).message.slice(0, 70)); }
+    }
+    check(ok === 20, 'every deep getLogs answered', failed[0] ?? ok);
+    check(w().learned.logsDepth != null && w().learned.logsDepth! < 50_000, 'learned: how deep its free logs go', w().learned.logsDepth);
+    walled.requests = 0;
+    for (let i = 0; i < 20; i++) await q.send('eth_getLogs', [{ address: '0x' + 'a'.repeat(40), fromBlock: '0x' + (h - 10).toString(16), toBlock: '0x' + h.toString(16) }]);
+    check(walled.requests > 0, 'it still serves recent getLogs', walled.requests);
+    q.destroy();
+    for (const m of [walled, free]) await m.stop();
 }
 
 console.log('\nan open websocket does not keep a finished script alive');

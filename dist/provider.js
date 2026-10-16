@@ -60,7 +60,13 @@ const CAPABILITY_RE = /unknown state|first available state|^\s*block\s+(?:number
  */
 const LAGGING_RE = /^\s*block\s+(?:number\s+)?#?\d+|block (?:not found|is not available|not yet|.*(?:ahead|beyond|greater than|future))|unknown block|header not found/i;
 const STATE_RE = /unknown state|first available state|state (?:is )?not available|missing trie node|historical state|pruned/i;
-const ALREADY_KNOWN = /already known|known transaction|already imported|nonce too low|replacement transaction underpriced/i;
+/**
+ * The node already has THIS transaction (same hash): the send succeeded somewhere.
+ * Not "nonce too low" or "replacement transaction underpriced" — those mean a
+ * DIFFERENT transaction holds the nonce, and treating them as success would leave
+ * the caller waiting on a hash that never mines.
+ */
+const ALREADY_KNOWN = /already known|known transaction|already imported/i;
 const HISTORY_DEPTH_GRACE = 64;
 /** Methods that submit a transaction: routed to sendRpc, never load-balanced. */
 const SEND_METHODS = new Set([
@@ -484,6 +490,11 @@ export class VettedProvider extends JsonRpcProvider {
                 if (first && Number(first[1]) > n.block) {
                     // Keeps state from block `first` on: how deep that is, from the head.
                     x.learned.stateDepth = Math.min(x.learned.stateDepth ?? Infinity, Math.max(0, (this.bestHead ?? Number(first[1])) - Number(first[1])));
+                }
+                else if (!first && STATE_RE.test(msg) && x.head != null && x.head >= n.block && this.bestHead != null) {
+                    // No number in the message, but this node was already past the block:
+                    // it is not behind, it no longer has that state (Sonic: latest only).
+                    x.learned.stateDepth = Math.min(x.learned.stateDepth ?? Infinity, Math.max(0, this.bestHead - n.block - 1));
                 }
                 else if (LAGGING_RE.test(msg) || (first && Number(first[1]) <= n.block)
                     || (STATE_RE.test(msg) && (this.bestHead == null || this.bestHead - n.block <= HISTORY_DEPTH_GRACE))) {

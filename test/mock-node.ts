@@ -27,7 +27,9 @@ export type MockOpts = {
     lagBlocks?: number;        // report head - lagBlocks
     headMs?: number;           // WS newHeads interval
     wsDieAfterMs?: number;     // each subscription stops delivering this long after it starts
+    sonicStateNoNumber?: boolean;   // like sonicState, but "First available state is " with no number (seen on Sonic)
     sonicState?: boolean;      // Sonic-style answers: past the head "block N not found"; outside kept state "Unknown state. First available state is N"
+    gatedDepth?: number;       // publicnode-style paywall: reads older than this many blocks (and old txs by hash) answer "Archive requests require a personal token"
 };
 
 const A = '0x' + 'a'.repeat(40), B = '0x' + 'b'.repeat(40);
@@ -60,13 +62,20 @@ export class MockNode {
     private stateAt(blk: number): { error: { code: number; message: string } } | null {
         if (!this.o.sonicState || !Number.isFinite(blk)) return null;
         const first = Math.max(0, this.head() - this.o.stateDepth);
-        if (blk > this.head() || blk < first) return { error: { code: -32000, message: `Unknown state. First available state is ${first}` } };
+        if (blk > this.head() || blk < first) return { error: { code: -32000, message: `Unknown state. First available state is ${this.o.sonicStateNoNumber ? '' : first}` } };
         return null;
     }
 
     handle(req: { id?: unknown; method: string; params?: any[] }): { result?: unknown; error?: { code: number; message: string; data?: unknown } } {
         const o = this.o, p = req.params ?? [];
         this.requests++;
+        if (o.gatedDepth != null) {
+            const gated = { error: { code: -32602, message: 'Archive requests require a personal token. Get one at: https://www.allnodes.com/publicnode' } };
+            const blk = req.method === 'eth_getLogs' ? parseInt(p[0]?.fromBlock ?? hex(this.head()), 16)
+                      : req.method === 'eth_call' || req.method === 'eth_getBalance' ? parseInt(p[1] ?? hex(this.head()), 16) : NaN;
+            if (Number.isFinite(blk) && this.head() - blk > o.gatedDepth) return gated;
+            if (req.method === 'eth_getTransactionByHash' && /aa$/i.test(String(p[0]))) return gated;   // "old" transactions end in aa
+        }
         if (o.missing.includes(req.method)) return { error: { code: -32601, message: `the method ${req.method} does not exist/is not available` } };
         switch (req.method) {
             case 'eth_chainId': return { result: hex(o.chainId) };
@@ -123,6 +132,7 @@ export class MockNode {
                 if (req.method === 'eth_uninstallFilter') { this.filterIds.delete(p[0]); return { result: true }; }
                 return { result: [] };
             case 'eth_sendRawTransaction': return { result: '0x' + '11'.repeat(32) };
+            case 'eth_getTransactionByHash': return { result: { hash: p[0], from: '0x' + '1'.repeat(40), to: null, blockNumber: hex(this.head() - 1) } };
             default: return { result: null };
         }
     }

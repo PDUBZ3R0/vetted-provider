@@ -1,13 +1,13 @@
 {
   "name": "vetted-provider",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "description": "Ethers provider that rates every public RPC for an EVM chain (getLogs limits, revert data, gas cap, rate limits, latency, WebSocket health) and pick the best one for the job.",
   "type": "module",
   "bin": {
     "vetrpc": "./dist/cli.js"
   },
   "scripts": {
-    "vet": "bash ./vet.sh",
+    "vet": "node --experimental-strip-types --disable-warning=ExperimentalWarning src/cli.ts vet",
     "best": "node --experimental-strip-types --disable-warning=ExperimentalWarning src/cli.ts best",
     "test": "node --experimental-strip-types --disable-warning=ExperimentalWarning test/mock.test.ts && node --experimental-strip-types --disable-warning=ExperimentalWarning test/provider.test.ts && node --experimental-strip-types --disable-warning=ExperimentalWarning test/feed.test.ts",
     "build": "tsc -p tsconfig.build.json"
