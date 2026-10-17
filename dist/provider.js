@@ -61,6 +61,19 @@ const CAPABILITY_RE = /unknown state|first available state|^\s*block\s+(?:number
 const LAGGING_RE = /^\s*block\s+(?:number\s+)?#?\d+|block (?:not found|is not available|not yet|.*(?:ahead|beyond|greater than|future))|unknown block|header not found/i;
 const STATE_RE = /unknown state|first available state|state (?:is )?not available|missing trie node|historical state|pruned/i;
 /**
+ * History behind a paywall: the endpoint serves recent data but refuses older
+ * reads unless you pay ("Archive requests require a personal token" —
+ * publicnode; "upgrade your plan", "requires an API key"). Another endpoint may
+ * serve the same request for free, so this is a capability failure, and the
+ * endpoint is kept off that kind of request for the rest of the run.
+ */
+// An endpoint's own policy refusing the request ("Request blocked", a WAF's 403
+// text). Seen on Robinhood: publicnode and ordofi answer address+topic getLogs with
+// "-32602: Request blocked" — the code says bad params, so it used to come back
+// as a real answer; under load the pool kept picking them and the scan died.
+const POLICY_RE = /request (?:is |was )?blocked|forbidden by administrative rules|request forbidden|access denied|not whitelisted/i;
+const GATED_RE = /archive (?:requests?|data|access|queries|calls|state|nodes?)\b.*\b(?:requires?|need|not (?:supported|available|allowed)|unavailable|disabled)|requires? (?:a |an )?(?:personal|api|access) (?:token|key)|requires? (?:a |an )?(?:paid|premium) (?:plan|subscription|tier)|personal token|upgrade (?:your )?(?:plan|tier|account)|(?:paid|premium) (?:plan|tier) (?:is )?required|api key (?:is )?required/i;
+/**
  * The node already has THIS transaction (same hash): the send succeeded somewhere.
  * Not "nonce too low" or "replacement transaction underpriced" — those mean a
  * DIFFERENT transaction holds the nonce, and treating them as success would leave
@@ -277,7 +290,9 @@ export class VettedProvider extends JsonRpcProvider {
     }
     /** Can member `x` do `need`, from its ratings and what it has taught us? undefined = unknown (allowed, ranked lower). */
     can(x, n) {
-        if (x.learned.missing.has(n.method))
+        if (x.learned.missing.has(n.method) || x.learned.refused?.has(n.method))
+            return false;
+        if (x.learned.gated?.has(n.method) && n.block == null && n.logsRange == null)
             return false;
         const L = x.rep?.logs, C = x.rep?.call, H = x.rep?.history;
         if (n.method in (x.rep?.methods ?? {}) && x.rep.methods[n.method] === false)
@@ -294,6 +309,8 @@ export class VettedProvider extends JsonRpcProvider {
             if (n.topicOnly && (x.learned.topicOnly ?? L?.topicOnly) === false)
                 return false;
             if (n.fromBlock != null && this.bestHead != null && this.bestHead - n.fromBlock > 1_000_000 && L?.oldLogs === false)
+                return false;
+            if (n.fromBlock != null && this.bestHead != null && x.learned.logsDepth != null && this.bestHead - n.fromBlock > x.learned.logsDepth)
                 return false;
         }
         if (n.gas != null) {
@@ -473,6 +490,26 @@ export class VettedProvider extends JsonRpcProvider {
             return 'capability';
         }
         const msg = `${r.error.message} ${typeof r.error.data === 'string' ? r.error.data : ''}`;
+        if (GATED_RE.test(msg) && !/revert/i.test(msg)) { // a contract's revert reason is an answer, whatever it says
+            // Paid-only history: learn how deep it goes (pinned reads, logs) or, for
+            // by-hash lookups that carry no block, keep the method off this endpoint.
+            x.errors++;
+            const depth = (b) => Math.max(0, (this.bestHead ?? b) - b - 1);
+            if (n.logsRange != null && n.fromBlock != null)
+                x.learned.logsDepth = Math.min(x.learned.logsDepth ?? Infinity, depth(n.fromBlock));
+            else if (n.block != null)
+                x.learned.stateDepth = Math.min(x.learned.stateDepth ?? Infinity, depth(n.block));
+            else
+                (x.learned.gated ??= new Set()).add(n.method);
+            return 'capability';
+        }
+        if (POLICY_RE.test(msg) && !/revert/i.test(msg)) {
+            // We can't tell which part of the request the policy objects to, so the
+            // method stays off this endpoint; others (or the private node) serve it.
+            x.errors++;
+            (x.learned.refused ??= new Set()).add(n.method);
+            return 'capability';
+        }
         if (CAPABILITY_RE.test(msg) || r.error.code === -32005) {
             x.errors++;
             if (n.logsRange != null) {
@@ -700,7 +737,7 @@ export class VettedProvider extends JsonRpcProvider {
                 ewmaMs: Math.round(x.ewmaMs), head: x.head,
                 state: now < x.openUntil ? 'down' : now < x.coolUntil ? 'cooling' : 'ok',
                 rps: Number.isFinite(x.rps) ? +x.rps.toFixed(1) : null,
-                learned: { ...x.learned, missing: [...x.learned.missing] },
+                learned: { ...x.learned, missing: [...x.learned.missing], gated: x.learned.gated ? [...x.learned.gated] : undefined, refused: x.learned.refused ? [...x.learned.refused] : undefined },
             })),
         };
     }

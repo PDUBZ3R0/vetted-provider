@@ -135,6 +135,8 @@ type Member = {
         logsDepth?: number;
         /** Methods it refuses behind a paywall when the data is old (by-hash lookups carry no block to judge age by). */
         gated?: Set<string>;
+        /** Methods its own policy refuses ("Request blocked"): kept off this endpoint. */
+        refused?: Set<string>;
     };
     // health
     ewmaMs: number;
@@ -170,6 +172,11 @@ const STATE_RE = /unknown state|first available state|state (?:is )?not availabl
  * serve the same request for free, so this is a capability failure, and the
  * endpoint is kept off that kind of request for the rest of the run.
  */
+// An endpoint's own policy refusing the request ("Request blocked", a WAF's 403
+// text). Seen on Robinhood: publicnode and ordofi answer address+topic getLogs with
+// "-32602: Request blocked" — the code says bad params, so it used to come back
+// as a real answer; under load the pool kept picking them and the scan died.
+const POLICY_RE = /request (?:is |was )?blocked|forbidden by administrative rules|request forbidden|access denied|not whitelisted/i;
 const GATED_RE = /archive (?:requests?|data|access|queries|calls|state|nodes?)\b.*\b(?:requires?|need|not (?:supported|available|allowed)|unavailable|disabled)|requires? (?:a |an )?(?:personal|api|access) (?:token|key)|requires? (?:a |an )?(?:paid|premium) (?:plan|subscription|tier)|personal token|upgrade (?:your )?(?:plan|tier|account)|(?:paid|premium) (?:plan|tier) (?:is )?required|api key (?:is )?required/i;
 /**
  * The node already has THIS transaction (same hash): the send succeeded somewhere.
@@ -364,7 +371,7 @@ export class VettedProvider extends JsonRpcProvider {
 
     /** Can member `x` do `need`, from its ratings and what it has taught us? undefined = unknown (allowed, ranked lower). */
     private can(x: Member, n: Need): boolean {
-        if (x.learned.missing.has(n.method)) return false;
+        if (x.learned.missing.has(n.method) || x.learned.refused?.has(n.method)) return false;
         if (x.learned.gated?.has(n.method) && n.block == null && n.logsRange == null) return false;
         const L = x.rep?.logs, C = x.rep?.call, H = x.rep?.history;
         if (n.method in (x.rep?.methods ?? {}) && x.rep!.methods![n.method] === false) return false;
@@ -547,6 +554,13 @@ export class VettedProvider extends JsonRpcProvider {
             if (n.logsRange != null && n.fromBlock != null) x.learned.logsDepth = Math.min(x.learned.logsDepth ?? Infinity, depth(n.fromBlock));
             else if (n.block != null) x.learned.stateDepth = Math.min(x.learned.stateDepth ?? Infinity, depth(n.block));
             else (x.learned.gated ??= new Set()).add(n.method);
+            return 'capability';
+        }
+        if (POLICY_RE.test(msg) && !/revert/i.test(msg)) {
+            // We can't tell which part of the request the policy objects to, so the
+            // method stays off this endpoint; others (or the private node) serve it.
+            x.errors++;
+            (x.learned.refused ??= new Set()).add(n.method);
             return 'capability';
         }
         if (CAPABILITY_RE.test(msg) || r.error.code === -32005) {
@@ -746,7 +760,7 @@ export class VettedProvider extends JsonRpcProvider {
                 ewmaMs: Math.round(x.ewmaMs), head: x.head,
                 state: now < x.openUntil ? 'down' : now < x.coolUntil ? 'cooling' : 'ok',
                 rps: Number.isFinite(x.rps) ? +x.rps.toFixed(1) : null,
-                learned: { ...x.learned, missing: [...x.learned.missing], gated: x.learned.gated ? [...x.learned.gated] : undefined },
+                learned: { ...x.learned, missing: [...x.learned.missing], gated: x.learned.gated ? [...x.learned.gated] : undefined, refused: x.learned.refused ? [...x.learned.refused] : undefined },
             })),
         };
     }

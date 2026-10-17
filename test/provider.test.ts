@@ -95,6 +95,21 @@ reset();
     narrow.o.maxRange = 2000;
 }
 
+console.log('\na policy refusal is the endpoint\'s problem, not an answer');
+reset();
+{
+    narrow.o.blockCombined = true;
+    routes.length = 0;
+    const f = { fromBlock: '0x' + (head - 99).toString(16), toBlock: '0x' + head.toString(16), address: ['0x' + 'a'.repeat(40)], topics: ['0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef'] };
+    let ok = 0;
+    for (let i = 0; i < 8; i++) { const r = await p.send('eth_getLogs', [f]); if (Array.isArray(r) && r.length === 100) ok++; }
+    check(ok === 8, '"-32602: Request blocked" is retried elsewhere: every request answered', ok);
+    const hits = routes.filter(r => r.url === narrow.url);
+    check(hits.length <= 1 && priv.requests === 0, 'the blocking endpoint is tried at most once, then the other public serves', routes.map(r => `${r.url === narrow.url ? 'narrow' : r.url === wide.url ? 'wide' : 'priv'}:${r.outcome}`));
+    check((p.stats().endpoints.find(e => e.url === narrow.url)!.learned as any).refused?.includes('eth_getLogs'), 'learned that it refuses eth_getLogs');
+    narrow.o.blockCombined = false;
+}
+
 console.log('\ntransactions go to sendRpc, and only there');
 {
     const seq = new MockNode({ ...base }), relay = new MockNode({ ...base });

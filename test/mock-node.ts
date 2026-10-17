@@ -29,6 +29,7 @@ export type MockOpts = {
     wsDieAfterMs?: number;     // each subscription stops delivering this long after it starts
     sonicStateNoNumber?: boolean;   // like sonicState, but "First available state is " with no number (seen on Sonic)
     sonicState?: boolean;      // Sonic-style answers: past the head "block N not found"; outside kept state "Unknown state. First available state is N"
+    blockCombined?: boolean;   // ordofi / publicnode on Robinhood: getLogs with addresses AND topics answer "-32602: Request blocked"
     gatedDepth?: number;       // publicnode-style paywall: reads older than this many blocks (and old txs by hash) answer "Archive requests require a personal token"
 };
 
@@ -111,6 +112,7 @@ export class MockNode {
                 const addrs: string[] | null = f.address == null ? null : Array.isArray(f.address) ? f.address : [f.address];
                 if (addrs && addrs.length > o.maxAddresses) return { error: { code: -32602, message: `too many addresses, max ${o.maxAddresses}` } };
                 if (!addrs && f.topics && !o.topicOnly) return { error: { code: -32701, message: 'Please specify an address in your request' } };
+                if (o.blockCombined && addrs && f.topics?.length) return { error: { code: -32602, message: 'Request blocked' } };
                 if (from < 100 && !o.oldLogs) return { error: { code: -32000, message: 'requested block range is beyond history' } };
                 const t0 = f.topics?.[0];
                 const want = (t: string) => t0 == null || (Array.isArray(t0) ? t0.includes(t) : t0 === t);

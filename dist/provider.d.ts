@@ -186,12 +186,16 @@ export declare class VettedProvider extends JsonRpcProvider {
             rps: number | null;
             learned: {
                 missing: string[];
+                gated: string[] | undefined;
+                refused: string[] | undefined;
                 maxRange?: number;
                 maxAddresses?: number;
                 topicOnly?: boolean;
                 gasCap?: number;
                 stateDepth?: number;
                 revertData?: boolean;
+                /** getLogs starting deeper than this many blocks below the head are refused as paid-only (an upper bound, tightened as it refuses more). */
+                logsDepth?: number;
             };
         }[];
     };
